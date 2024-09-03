@@ -8,6 +8,7 @@ RUN apt-get -y upgrade
 
 # Required for jsc
 RUN apt-get install -y libicu-dev
+RUN apt-get -y install nodejs
 
 RUN mkdir /home/fuzzer
 WORKDIR /home/fuzzer
