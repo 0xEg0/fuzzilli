@@ -97,6 +97,10 @@ Options:
     --additionalArguments=args   : Pass additional arguments to the JS engine. If multiple arguments are passed, they should be separated by a comma.
     --tag=tag                    : Optional string tag associated with this instance which will be stored in the settings.json file as well as in crashing samples.
                                    This can for example be used to remember the target revision that is being fuzzed.
+-------------------------------------------------------------------------------------------------------------------------------------------------------------------
+ADDITIONAL : 
+    --templateName               : Used to specify a template to use when using the HybridEngine. [default, custom, <TEMPLATE_NAME>]
+    --jsCorpusPath=<PATH>        : Specifying a Path to use to get Javascript files that will be compiled to generate a corpus.
 """)
     exit(0)
 }
@@ -152,6 +156,10 @@ let swarmTesting = args.has("--swarmTesting")
 let argumentRandomization = args.has("--argumentRandomization")
 let additionalArguments = args["--additionalArguments"] ?? ""
 let tag = args["--tag"]
+// ====== Additional ======
+let templateName = args["--templateName"] ?? "default"
+let jsCorpusImportPath = args["--jsCorpusPath"]
+// ========================
 
 guard numJobs >= 1 else {
     configError("Must have at least 1 job")
@@ -248,7 +256,7 @@ if corpusImportPath != nil && corpusImportMode == .full && corpusName == "markov
     configError("Markov corpus is not compatible with the .full corpus import mode")
 }
 
-guard !resume || corpusImportPath == nil else {
+guard !resume || corpusImportPath == nil || jsCorpusImportPath  == nil else {
     configError("Cannot resume and import an existing corpus at the same time")
 }
 
@@ -286,7 +294,7 @@ guard let corpusSyncMode = corpusSyncModeByName[corpusSyncMode] else {
     configError("Invalid corpus synchronization mode \(corpusSyncMode)")
 }
 
-if staticCorpus && !(resume || isNetworkChildNode || corpusImportPath != nil) {
+if staticCorpus && !(resume || isNetworkChildNode || corpusImportPath != nil || jsCorpusImportPath != nil) {
     configError("Static corpus requires this instance to import a corpus or to participate in distributed fuzzing as a child node")
 }
 
@@ -360,6 +368,43 @@ func loadCorpus(from dirPath: String) -> [Program] {
     return programs
 }
 
+func loadJSCorpus(from dirPath: String) -> [Program] {
+    var isDir: ObjCBool = false
+    guard FileManager.default.fileExists(atPath: dirPath, isDirectory: &isDir) && isDir.boolValue else {
+        logger.fatal("Cannot import programs from \(dirPath), it is not a directory!")
+    }
+
+    var programs = [Program]()
+    let fileEnumerator = FileManager.default.enumerator(atPath: dirPath)
+    while let filename = fileEnumerator?.nextObject() as? String {
+        guard filename.hasSuffix(".js") else { continue }
+        let fname : String
+        do {
+            let compilerUtils = CompilerUtils()
+            fname = compilerUtils.compileJavascript(filename)
+        }
+        catch {
+            logger.error("Failed to compile program \(filename): \(error). Skipping")
+            continue
+        }
+        guard fname.hasSuffix(".fzil") else { continue }
+        let path = dirPath + "/" + fname
+        do {
+            let data = try Data(contentsOf: URL(fileURLWithPath: path))
+            let pb = try Fuzzilli_Protobuf_Program(serializedBytes: data)
+            let program = try Program.init(from: pb)
+            if !program.isEmpty {
+                programs.append(program)
+            }
+        } catch {
+            logger.error("Failed to load program \(path): \(error). Skipping")
+        }
+    }
+
+    return programs
+}
+
+
 // When using multiple jobs, all Fuzzilli instances should use the same arguments for the JS shell, even if
 // argument randomization is enabled. This way, their corpora are "compatible" and crashes that require
 // (a subset of) the randomly chosen flags can be reproduced on the main instance.
@@ -427,15 +472,34 @@ func makeFuzzer(with configuration: Configuration) -> Fuzzer {
     }
 
     // Program templates to use.
-    var programTemplates = profile.additionalProgramTemplates
-    for template in ProgramTemplates {
-        guard let weight = programTemplateWeights[template.name] else {
-            print("Missing weight for program template \(template.name) in ProgramTemplateWeights.swift")
-            exit(-1)
-        }
+    var programTemplates = WeightedList<ProgramTemplate>([])
+    if templateName == "default" {
+        programTemplates = profile.additionalProgramTemplates
+        for template in ProgramTemplates {
+            guard let weight = programTemplateWeights[template.name] else {
+                print("Missing weight for program template \(template.name) in ProgramTemplateWeights.swift")
+                exit(-1)
+            }
 
-        programTemplates.append(template, withWeight: weight)
+            programTemplates.append(template, withWeight: weight)
+        }
+    } else if templateName == "custom" {
+        for template in OptionalProgramTemplates {
+            programTemplates.append(template, withWeight: 1)
+        }
+    } else {
+        for template in OptionalProgramTemplates {
+            if template.name == templateName {
+                programTemplates.append(template, withWeight: 1)
+                break
+            }
+        }
     }
+    if programTemplates.count == 0 {
+        print("Template name : \(templateName) could not be found in OptionalProgramTemplates.swift")
+        exit(-1)
+    }
+    print("Using Template : \(templateName)")
 
     // The environment containing available builtins, property names, and method names.
     let environment = JavaScriptEnvironment(additionalBuiltins: profile.additionalBuiltins, additionalObjectGroups: profile.additionalObjectGroups)
@@ -595,7 +659,7 @@ fuzzer.sync {
         fuzzer.scheduleCorpusImport(corpus, importMode: .interestingOnly(shouldMinimize: false))  // We assume that the programs are already minimized
     }
 
-    // ... or import an existing corpus.
+    // import an existing corpus.
     if let path = corpusImportPath {
         assert(!resume)
         let corpus = loadCorpus(from: path)
@@ -605,6 +669,18 @@ fuzzer.sync {
         logger.info("Scheduling corpus import of \(corpus.count) programs with mode \(corpusImportModeName).")
         fuzzer.scheduleCorpusImport(corpus, importMode: corpusImportMode)
     }
+
+    // ... or import a js corpus.
+    if let path = jsCorpusImportPath {
+        assert(!resume)
+        let corpus = loadJSCorpus(from: path)
+        guard !corpus.isEmpty else {
+            logger.fatal("Cannot import an empty corpus.")
+        }
+        logger.info("Scheduling corpus import of \(corpus.count) programs with mode \(corpusImportModeName).")
+        fuzzer.scheduleCorpusImport(corpus, importMode: corpusImportMode)
+    }
+
 
     // Initialize the fuzzer, and run startup tests
     fuzzer.initialize()
