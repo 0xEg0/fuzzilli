@@ -30,5 +30,6 @@ ADD Corpus corpus
 # Add Fuzzilli binaries
 ADD FuzzilliBuilder/out/Fuzzilli Fuzzilli
 ADD FuzzilliBuilder/out/REPRLRun REPRLRun
+ADD FuzzilliBuilder/out/Fuzzilli_Fuzzilli.resources Fuzzilli_Fuzzilli.resources
 
 RUN mkdir fuzz
