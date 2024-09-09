@@ -8,7 +8,7 @@ RUN apt-get -y upgrade
 
 # Required for jsc
 RUN apt-get install -y libicu-dev
-RUN apt-get -y install nodejs
+RUN apt-get -y install nodejs npm
 
 RUN mkdir /home/fuzzer
 WORKDIR /home/fuzzer
@@ -31,5 +31,7 @@ ADD Corpus corpus
 ADD FuzzilliBuilder/out/Fuzzilli Fuzzilli
 ADD FuzzilliBuilder/out/REPRLRun REPRLRun
 ADD FuzzilliBuilder/out/Fuzzilli_Fuzzilli.resources Fuzzilli_Fuzzilli.resources
+ADD FuzzilliBuilder/out/package.json package.json
 
+RUN npm install
 RUN mkdir fuzz

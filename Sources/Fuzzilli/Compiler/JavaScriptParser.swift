@@ -61,7 +61,8 @@ public class JavaScriptParser {
         let task = Process()
         // Don't set standardOutput: we only need stderr for error reporting and
         // capturing stdout here may cause a deadlock if the pipe becomes full.
-        task.standardOutput = FileHandle.nullDevice
+        // task.standardOutput = FileHandle.nullDevice
+        task.standardOutput = output
         task.standardError = output
         task.arguments = [parserScriptPath] + arguments
         // TODO: move this method into the NodeJS class instead of manually invoking the node.js binary here
@@ -71,7 +72,8 @@ public class JavaScriptParser {
 
         let data = output.fileHandleForReading.readDataToEndOfFile()
         guard task.terminationStatus == 0 else {
-            throw ParserError.parsingFailed(String(data: data, encoding: .utf8)!)
+            // throw ParserError.parsingFailed(String(data: data, encoding: .utf8)!)
+            throw ParserError.parsingFailed(String(arguments[1]))
         }
     }
 

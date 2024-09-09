@@ -146,7 +146,7 @@ public class CompilerUtils {
             let outputPath = URL(fileURLWithPath: path).deletingPathExtension().appendingPathExtension("fzil")
             try program.asProtobuf().serializedData().write(to: outputPath)
             print("FuzzIL program written to \(outputPath.relativePath)")
-            return outputPath.absoluteString
+            return outputPath.lastPathComponent
         } catch {
             print("Failed to store output program to disk: \(error)")
             exit(-1)

@@ -378,26 +378,26 @@ func loadJSCorpus(from dirPath: String) -> [Program] {
     let fileEnumerator = FileManager.default.enumerator(atPath: dirPath)
     while let filename = fileEnumerator?.nextObject() as? String {
         guard filename.hasSuffix(".js") else { continue }
+        let path = dirPath + "/"
         let fname : String
         do {
             let compilerUtils = CompilerUtils()
-            fname = compilerUtils.compileJavascript(filename)
+            fname = compilerUtils.compileJavascript(path + filename)
         }
         catch {
             logger.error("Failed to compile program \(filename): \(error). Skipping")
             continue
         }
         guard fname.hasSuffix(".fzil") else { continue }
-        let path = dirPath + "/" + fname
         do {
-            let data = try Data(contentsOf: URL(fileURLWithPath: path))
+            let data = try Data(contentsOf: URL(fileURLWithPath: path + fname))
             let pb = try Fuzzilli_Protobuf_Program(serializedBytes: data)
             let program = try Program.init(from: pb)
             if !program.isEmpty {
                 programs.append(program)
             }
         } catch {
-            logger.error("Failed to load program \(path): \(error). Skipping")
+            logger.error("Failed to load program \(path + fname): \(error). Skipping")
         }
     }
 
@@ -680,7 +680,6 @@ fuzzer.sync {
         logger.info("Scheduling corpus import of \(corpus.count) programs with mode \(corpusImportModeName).")
         fuzzer.scheduleCorpusImport(corpus, importMode: corpusImportMode)
     }
-
 
     // Initialize the fuzzer, and run startup tests
     fuzzer.initialize()
