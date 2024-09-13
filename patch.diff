@@ -1,0 +1,2787 @@
+diff --git a/Cloud/Docker/Dockerfile b/Cloud/Docker/Dockerfile
+index 403b9de..456681e 100644
+--- a/Cloud/Docker/Dockerfile
++++ b/Cloud/Docker/Dockerfile
+@@ -8,6 +8,7 @@ RUN apt-get -y upgrade
+ 
+ # Required for jsc
+ RUN apt-get install -y libicu-dev
++RUN apt-get -y install nodejs npm
+ 
+ RUN mkdir /home/fuzzer
+ WORKDIR /home/fuzzer
+@@ -29,5 +30,8 @@ ADD Corpus corpus
+ # Add Fuzzilli binaries
+ ADD FuzzilliBuilder/out/Fuzzilli Fuzzilli
+ ADD FuzzilliBuilder/out/REPRLRun REPRLRun
++ADD FuzzilliBuilder/out/Fuzzilli_Fuzzilli.resources Fuzzilli_Fuzzilli.resources
++ADD FuzzilliBuilder/out/package.json package.json
+ 
++RUN npm install
+ RUN mkdir fuzz
+diff --git a/Cloud/Docker/FuzzilliBuilder/Dockerfile b/Cloud/Docker/FuzzilliBuilder/Dockerfile
+index 0ebff65..0e9b77e 100644
+--- a/Cloud/Docker/FuzzilliBuilder/Dockerfile
++++ b/Cloud/Docker/FuzzilliBuilder/Dockerfile
+@@ -10,4 +10,4 @@ WORKDIR /home/builder
+ 
+ ADD fuzzilli fuzzilli
+ 
+-RUN cd fuzzilli && swift test && swift build -c release
++RUN cd fuzzilli && swift build -c release
+diff --git a/Cloud/Docker/FuzzilliBuilder/build.sh b/Cloud/Docker/FuzzilliBuilder/build.sh
+index a050ded..cc3a715 100755
+--- a/Cloud/Docker/FuzzilliBuilder/build.sh
++++ b/Cloud/Docker/FuzzilliBuilder/build.sh
+@@ -19,6 +19,8 @@ mkdir -p out
+ docker create --name temp_container fuzzilli_builder
+ docker cp temp_container:/home/builder/fuzzilli/.build/release/FuzzilliCli out/Fuzzilli
+ docker cp temp_container:/home/builder/fuzzilli/.build/release/REPRLRun out/REPRLRun
++docker cp temp_container:/home/builder/fuzzilli/.build/x86_64-unknown-linux-gnu/release/Fuzzilli_Fuzzilli.resources out/Fuzzilli_Fuzzilli.resources
++docker cp temp_container:/home/builder/fuzzilli/Sources/Fuzzilli/Compiler/Parser/package.json out/
+ docker rm temp_container
+ 
+ # Clean up
+diff --git a/Cloud/Docker/V8Builder/Dockerfile b/Cloud/Docker/V8Builder/Dockerfile
+index 6d060a6..9dbd74c 100644
+--- a/Cloud/Docker/V8Builder/Dockerfile
++++ b/Cloud/Docker/V8Builder/Dockerfile
+@@ -16,21 +16,17 @@ RUN gclient
+ RUN gclient metrics --opt-out
+ RUN mkdir v8 && cd v8 && fetch v8
+ WORKDIR /home/builder/v8/v8
+-RUN git checkout master
+ 
+ # Docker will attempt to cache the output of every step. That's fine (and useful to speed things up, e.g. by avoiding
+ # the need to download the entire source repository again every time!). However, whenever the following ARG is changed
+ # (i.e. we are building a new version of the engine), a cache miss occurs (because the build context changed) and all
+ # steps from here on are rerun. That, however, means we might be operating on an old checkout of the source code from
+ # the cache, and so we update it again before checking out the requested revision.
+-ARG rev=master
+ 
+ # Update system packages first
+ RUN apt-get -y update && apt-get -y upgrade
+ 
+ # Fetch latest source code and checkout requested source revision
+-RUN git pull
+-RUN git checkout $rev
+ RUN gclient sync
+ 
+ # Upload and apply patches
+diff --git a/Cloud/Docker/V8Builder/build.sh b/Cloud/Docker/V8Builder/build.sh
+index b218a09..5f0ca03 100755
+--- a/Cloud/Docker/V8Builder/build.sh
++++ b/Cloud/Docker/V8Builder/build.sh
+@@ -11,7 +11,7 @@ cp -R $FUZZILLI_ROOT/Targets/V8/Patches .
+ cp $FUZZILLI_ROOT/Targets/V8/fuzzbuild.sh .
+ 
+ # Fetch the source code, apply patches, and compile the engine
+-docker build --build-arg rev=$REV -t v8_builder .
++docker build --no-cache --build-arg rev=$REV -t v8_builder .
+ 
+ # Copy build products
+ mkdir -p out
+diff --git a/Sources/Fuzzilli/Base/ProgramBuilder.swift b/Sources/Fuzzilli/Base/ProgramBuilder.swift
+index 98e0f40..3eb4cb9 100644
+--- a/Sources/Fuzzilli/Base/ProgramBuilder.swift
++++ b/Sources/Fuzzilli/Base/ProgramBuilder.swift
+@@ -495,12 +495,17 @@ public class ProgramBuilder {
+         func createObjectWithProperties(_ type: ILType) -> Variable  {
+             assert(type.MayBe(.object()))
+ 
++            // Before we do any generation below, let's take into account that we already create a variable with this invocation, i.e. the createObject at the end.
++            // Therefore we need to decrease the budget here temporarily.
++            self.argumentGenerationVariableBudget! -= 1
++            // We defer the increase again, because at that point the variable is actually visible, i.e. `numVariables` was increased through the `createObject` call.
++            defer { self.argumentGenerationVariableBudget! += 1 }
++
+             var properties: [String: Variable] = [:]
+ 
+             for propertyName in type.properties {
+                 // If we have an object that has a group, we should get a type here, otherwise if we don't have a group, we will get .anything.
+                 let propType = fuzzer.environment.type(ofProperty: propertyName, on: type)
+-                // Here we can enter generateType again, and end up here again if we need config objects for config objects, therefore we pass the recursion counter back into generateType, which will bail out eventually if there is a cycle.
+                 properties[propertyName] = generateType(propType)
+             }
+ 
+@@ -526,8 +531,8 @@ public class ProgramBuilder {
+                 }
+             }
+ 
+-            if numVariables > argumentGenerationVariableBudget! {
+-                logger.warning("Reached variable generation limit in generateType for Signature: \(argumentGenerationSignature!).")
++            if numVariables >= argumentGenerationVariableBudget! {
++                logger.warning("Reached variable generation limit in generateType for Signature: \(argumentGenerationSignature!), returning a random variable for use as type \(type).")
+                 return randomVariable(forUseAs: type)
+             }
+ 
+@@ -950,7 +955,7 @@ public class ProgramBuilder {
+ 
+     /// Adopts an instruction from the program that is currently configured for adoption into the program being constructed.
+     public func adopt(_ instr: Instruction) {
+-        internalAppend(Instruction(instr.op, inouts: adopt(instr.inouts)))
++        internalAppend(Instruction(instr.op, inouts: adopt(instr.inouts), flags: instr.flags))
+     }
+ 
+     /// Append an instruction at the current position.
+@@ -1248,7 +1253,7 @@ public class ProgramBuilder {
+                 variableMap[output] = nextVariable()
+             }
+             let inouts = instr.inouts.map({ variableMap[$0]! })
+-            append(Instruction(instr.op, inouts: inouts))
++            append(Instruction(instr.op, inouts: inouts, flags: instr.flags))
+         }
+ 
+         trace("Splicing done")
+@@ -1599,7 +1604,7 @@ public class ProgramBuilder {
+             inouts.append(nextVariable())
+         }
+ 
+-        return internalAppend(Instruction(op, inouts: inouts))
++        return internalAppend(Instruction(op, inouts: inouts, flags: .empty))
+     }
+ 
+     @discardableResult
+diff --git a/Sources/Fuzzilli/CodeGen/CodeGeneratorWeights.swift b/Sources/Fuzzilli/CodeGen/CodeGeneratorWeights.swift
+index bddfbc5..9ce5be3 100644
+--- a/Sources/Fuzzilli/CodeGen/CodeGeneratorWeights.swift
++++ b/Sources/Fuzzilli/CodeGen/CodeGeneratorWeights.swift
+@@ -40,6 +40,7 @@ public let codeGeneratorWeights = [
+     "ArgumentsAccessGenerator":                 3,
+     "FunctionWithArgumentsAccessGenerator":     2,
+     "BuiltinGenerator":                         10,
++    "BuiltinOverwriteGenerator":                3,
+     "LoadNewTargetGenerator":                   3,
+ 
+     "ObjectLiteralGenerator":                   10,
+diff --git a/Sources/Fuzzilli/CodeGen/CodeGenerators.swift b/Sources/Fuzzilli/CodeGen/CodeGenerators.swift
+index 791362c..f8a9cd5 100644
+--- a/Sources/Fuzzilli/CodeGen/CodeGenerators.swift
++++ b/Sources/Fuzzilli/CodeGen/CodeGenerators.swift
+@@ -749,6 +749,10 @@ public let CodeGenerators: [CodeGenerator] = [
+         b.loadBuiltin(b.randomBuiltin())
+     },
+ 
++    CodeGenerator("BuiltinOverwriteGenerator", inputs: .one) { b, value in
++        b.storeNamedVariable(b.randomBuiltin(), value)
++    },
++
+     RecursiveCodeGenerator("PlainFunctionGenerator") { b in
+         let f = b.buildPlainFunction(with: b.randomParameters(), isStrict: probability(0.1)) { _ in
+             b.buildRecursive()
+diff --git a/Sources/Fuzzilli/Compiler/Compiler.swift b/Sources/Fuzzilli/Compiler/Compiler.swift
+index 9accca0..3c30cff 100644
+--- a/Sources/Fuzzilli/Compiler/Compiler.swift
++++ b/Sources/Fuzzilli/Compiler/Compiler.swift
+@@ -57,6 +57,9 @@ public class JavaScriptCompiler {
+     /// The next free FuzzIL variable.
+     private var nextVariable = 0
+ 
++    /// Context analyzer to track the context of the code being compiled. Used for example to distinguish switch and loop breaks.
++    private var contextAnalyzer = ContextAnalyzer()
++
+     public func compile(_ ast: AST) throws -> Program {
+         reset()
+ 
+@@ -441,8 +444,16 @@ public class JavaScriptCompiler {
+             emit(EndForOfLoop())
+ 
+         case .breakStatement:
+-            // TODO currently we assume this is a LoopBreak, but once we support switch-statements, it could also be a SwitchBreak
+-            emit(LoopBreak())
++            // If we're in both .loop and .switch context, then the loop must be the most recent context 
++            // (switch blocks don't propagate an outer .loop context) so we just need to check for .loop here
++            // TODO remove this comment once the Analyzer bug fixs has been merged. Until then the code in this switch case is buggy.
++            if contextAnalyzer.context.contains(.loop){
++                emit(LoopBreak())
++            } else if contextAnalyzer.context.contains(.switchBlock){
++                emit(SwitchBreak())
++            } else {
++                throw CompilerError.invalidNodeError("break statement outside of loop or switch")
++            }
+ 
+         case .continueStatement:
+             emit(LoopContinue())
+@@ -486,6 +497,35 @@ public class JavaScriptCompiler {
+                 try compileBody(withStatement.body)
+             }
+             emit(EndWith())
++        case .switchStatement(let switchStatement):
++            // TODO Replace the precomputation of tests with compilation of the test expressions in the cases.
++            // To do this, we would need to redesign Switch statements in FuzzIL to (for example) have a BeginSwitchCaseHead, BeginSwitchCaseBody, and EndSwitchCase. 
++            // Then the expression would go inside the header.
++            var precomputedTests = [Variable]()
++            for caseStatement in switchStatement.cases {
++                if caseStatement.hasTest {
++                    let test = try compileExpression(caseStatement.test)
++                    precomputedTests.append(test)
++                } 
++            }
++            let discriminant = try compileExpression(switchStatement.discriminant)
++            emit(BeginSwitch(), withInputs: [discriminant])
++            for caseStatement in switchStatement.cases {
++                if caseStatement.hasTest {
++                    emit(BeginSwitchCase(), withInputs: [precomputedTests.removeFirst()])
++                } else {
++                    emit(BeginSwitchDefaultCase())
++                }
++                try enterNewScope {
++                    for statement in caseStatement.consequent {
++                        try compileStatement(statement)
++                    }
++                }
++                // We could also do an optimization here where we check if the last statement in the case is a break, and if so, we drop the last instruction
++                // and set the fallsThrough flag to false.
++                emit(EndSwitchCase(fallsThrough: true)) 
++            }
++            emit(EndSwitch())
+         }
+     }
+ 
+@@ -998,7 +1038,8 @@ public class JavaScriptCompiler {
+         let outputs = (0..<op.numOutputs).map { _ in nextFreeVariable() }
+         let innerOutputs = (0..<op.numInnerOutputs).map { _ in nextFreeVariable() }
+         let inouts = inputs + outputs + innerOutputs
+-        let instr = Instruction(op, inouts: inouts)
++        let instr = Instruction(op, inouts: inouts, flags: .empty)
++        contextAnalyzer.analyze(instr)
+         return code.append(instr)
+     }
+ 
+diff --git a/Sources/Fuzzilli/Compiler/JavaScriptParser.swift b/Sources/Fuzzilli/Compiler/JavaScriptParser.swift
+index f6a12f1..4f95f55 100644
+--- a/Sources/Fuzzilli/Compiler/JavaScriptParser.swift
++++ b/Sources/Fuzzilli/Compiler/JavaScriptParser.swift
+@@ -61,7 +61,8 @@ public class JavaScriptParser {
+         let task = Process()
+         // Don't set standardOutput: we only need stderr for error reporting and
+         // capturing stdout here may cause a deadlock if the pipe becomes full.
+-        task.standardOutput = FileHandle.nullDevice
++        // task.standardOutput = FileHandle.nullDevice
++        task.standardOutput = output
+         task.standardError = output
+         task.arguments = [parserScriptPath] + arguments
+         // TODO: move this method into the NodeJS class instead of manually invoking the node.js binary here
+@@ -71,7 +72,8 @@ public class JavaScriptParser {
+ 
+         let data = output.fileHandleForReading.readDataToEndOfFile()
+         guard task.terminationStatus == 0 else {
+-            throw ParserError.parsingFailed(String(data: data, encoding: .utf8)!)
++            // throw ParserError.parsingFailed(String(data: data, encoding: .utf8)!)
++            throw ParserError.parsingFailed(String(arguments[1]))
+         }
+     }
+ 
+diff --git a/Sources/Fuzzilli/Compiler/Parser/parser.js b/Sources/Fuzzilli/Compiler/Parser/parser.js
+index 2029c6a..07c8869 100644
+--- a/Sources/Fuzzilli/Compiler/Parser/parser.js
++++ b/Sources/Fuzzilli/Compiler/Parser/parser.js
+@@ -326,6 +326,18 @@ function parse(script, proto) {
+                 withStatement.body = visitStatement(node.body);
+                 return makeStatement('WithStatement', withStatement);
+             }
++            case 'SwitchStatement': {
++                let switchStatement = {};
++                switchStatement.discriminant = visitExpression(node.discriminant);
++                switchStatement.cases = node.cases.map(visitStatement);
++                return makeStatement('SwitchStatement', switchStatement);
++            }
++            case 'SwitchCase': {
++                let switchCase = {};
++                if (node.test) {switchCase.test = visitExpression(node.test)}
++                switchCase.consequent = node.consequent.map(visitStatement);
++                return switchCase;
++            }
+             default: {
+                 throw "Unhandled node type " + node.type;
+             }
+diff --git a/Sources/Fuzzilli/Compiler/Utils/utils.swift b/Sources/Fuzzilli/Compiler/Utils/utils.swift
+new file mode 100644
+index 0000000..f5a0e9b
+--- /dev/null
++++ b/Sources/Fuzzilli/Compiler/Utils/utils.swift
+@@ -0,0 +1,155 @@
++// Copyright 2020 Google LLC
++//
++// Licensed under the Apache License, Version 2.0 (the "License");
++// you may not use this file except in compliance with the License.
++// You may obtain a copy of the License at
++//
++// https://www.apache.org/licenses/LICENSE-2.0
++//
++// Unless required by applicable law or agreed to in writing, software
++// distributed under the License is distributed on an "AS IS" BASIS,
++// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++// See the License for the specific language governing permissions and
++// limitations under the License.
++
++import Foundation
++
++public class CompilerUtils {
++    
++    let jsFileExtension = ".js"
++    let protoBufFileExtension = ".fzil"
++
++    let jsPrefix = ""
++    let jsSuffix = ""
++
++    public init() {
++        self.jsLifter = JavaScriptLifter(prefix: jsPrefix, suffix: jsSuffix, ecmaVersion: ECMAScriptVersion.es6)
++        self.fuzzILLifter = FuzzILLifter()    
++    }
++    
++    private let jsLifter : JavaScriptLifter
++    private let fuzzILLifter : FuzzILLifter
++ 
++    // Default list of functions that are filtered out during compilation. These are functions that may be used in testcases but which do not influence the test's behaviour and so should be omitted for fuzzing.
++    // The functions can use the wildcard '*' character as _last_ character, in which case a prefix match will be performed.
++    let filteredFunctionsForCompiler = [
++        "assert*",
++        "print*",
++        "enterFunc",
++        "startTest"
++    ]
++
++    // Loads a serialized FuzzIL program from the given file
++    public func loadProgram(from path: String) throws -> Program {
++        let data = try Data(contentsOf: URL(fileURLWithPath: path))
++        let proto = try Fuzzilli_Protobuf_Program(serializedBytes: data)
++        let program = try Program(from: proto)
++        return program
++    }
++
++    public func loadAllPrograms(in dirPath: String) -> [(filename: String, program: Program)] {
++        var isDir: ObjCBool = false
++        if !FileManager.default.fileExists(atPath: dirPath, isDirectory:&isDir) || !isDir.boolValue {
++            print("\(dirPath) is not a directory!")
++            exit(-1)
++        }
++
++        let fileEnumerator = FileManager.default.enumerator(atPath: dirPath)
++        var results = [(String, Program)]()
++        while let filename = fileEnumerator?.nextObject() as? String {
++            guard filename.hasSuffix(protoBufFileExtension) else { continue }
++            let path = dirPath + "/" + filename
++            do {
++                let program = try loadProgram(from: path)
++                results.append((filename, program))
++            } catch FuzzilliError.programDecodingError(let reason) {
++                print("Failed to load program \(path): \(reason)")
++            } catch {
++                print("Failed to load program \(path) due to unexpected error: \(error)")
++            }
++        }
++        return results
++    }
++
++    // Take a program and lifts it to JavaScript
++    public func liftToJS(_ prog: Program) -> String {
++        let res = jsLifter.lift(prog)
++        return res.trimmingCharacters(in: .whitespacesAndNewlines)
++    }
++
++    // Take a program and lifts it to FuzzIL's text format
++    public func liftToFuzzIL(_ prog: Program) -> String {
++        let res = fuzzILLifter.lift(prog)
++        return res.trimmingCharacters(in: .whitespacesAndNewlines)
++    }
++
++    // Loads all .fzil files in a directory, and lifts them to JS
++    // Returns the number of files successfully converted
++    public func liftAllPrograms(in dirPath: String, with lifter: Lifter, fileExtension: String) -> Int {
++        var numLiftedPrograms = 0
++        for (filename, program) in loadAllPrograms(in: dirPath) {
++            let newFilePath = "\(dirPath)/\(filename.dropLast(protoBufFileExtension.count))\(fileExtension)"
++            let content = lifter.lift(program)
++            do {
++                try content.write(to: URL(fileURLWithPath: newFilePath), atomically: false, encoding: String.Encoding.utf8)
++                numLiftedPrograms += 1
++            } catch {
++                print("Failed to write file \(newFilePath): \(error)")
++            }
++        }
++        return numLiftedPrograms
++    }
++
++    public func loadProgramOrExit(from path: String) -> Program {
++        do {
++            return try loadProgram(from: path)
++        } catch {
++            print("Failed to load program from \(path): \(error)")
++            exit(-1)
++        }
++    }
++
++    // Compile a JavaScript program to a FuzzIL program. Requires node.js
++    public func compileJavascript(_ path: String) -> String{
++        // We require a NodeJS executor here as we need certain node modules.
++        guard let nodejs = JavaScriptExecutor(type: .nodejs) else {
++            print("Could not find the NodeJS executable.")
++            exit(-1)
++        }
++        guard let parser = JavaScriptParser(executor: nodejs) else {
++            print("The JavaScript parser does not appear to be working. See Sources/Fuzzilli/Compiler/Parser/README.md for instructions on how to set it up.")
++            exit(-1)
++        }
++
++        let ast: JavaScriptParser.AST
++        do {
++            ast = try parser.parse(path)
++        } catch {
++            print("Failed to parse \(path): \(error)")
++            exit(-1)
++        }
++
++        let compiler = JavaScriptCompiler(deletingCallTo: filteredFunctionsForCompiler)
++        let program: Program
++        do {
++            program = try compiler.compile(ast)
++        } catch {
++            print("Failed to compile: \(error)")
++            exit(-1)
++        }
++
++        print(fuzzILLifter.lift(program))
++        print()
++        print(jsLifter.lift(program))
++
++        do {
++            let outputPath = URL(fileURLWithPath: path).deletingPathExtension().appendingPathExtension("fzil")
++            try program.asProtobuf().serializedData().write(to: outputPath)
++            print("FuzzIL program written to \(outputPath.relativePath)")
++            return outputPath.lastPathComponent
++        } catch {
++            print("Failed to store output program to disk: \(error)")
++            exit(-1)
++        }
++    }
++}
+\ No newline at end of file
+diff --git a/Sources/Fuzzilli/FuzzIL/Code.swift b/Sources/Fuzzilli/FuzzIL/Code.swift
+index dd9e08b..1e63b0f 100644
+--- a/Sources/Fuzzilli/FuzzIL/Code.swift
++++ b/Sources/Fuzzilli/FuzzIL/Code.swift
+@@ -55,11 +55,11 @@ public struct Code: Collection {
+     /// Access the ith instruction in this code.
+     public subscript(i: Int) -> Instruction {
+         get {
+-            assert(instructions[i].hasIndex && instructions[i].index == i)
++            assert(instructions[i].index == i)
+             return instructions[i]
+         }
+         set {
+-            return instructions[i] = Instruction(newValue.op, inouts: newValue.inouts, index: i)
++            return instructions[i] = Instruction(newValue.op, inouts: newValue.inouts, index: i, flags: newValue.flags)
+         }
+     }
+ 
+@@ -106,7 +106,7 @@ public struct Code: Collection {
+     /// The inserted instruction will now also contain its index in this code.
+     @discardableResult
+     public mutating func append(_ instr: Instruction) -> Instruction {
+-        let instr = Instruction(instr.op, inouts: instr.inouts, index: count)
++        let instr = Instruction(instr.op, inouts: instr.inouts, index: count, flags: instr.flags)
+         instructions.append(instr)
+         return instr
+     }
+@@ -171,7 +171,7 @@ public struct Code: Collection {
+                 numVariables += 1
+             }
+             let inouts = instr.inouts.map({ varMap[$0]! })
+-            self[idx] = Instruction(instr.op, inouts: inouts)
++            self[idx] = Instruction(instr.op, inouts: inouts, flags: instr.flags)
+         }
+     }
+ 
+@@ -306,6 +306,19 @@ public struct Code: Collection {
+         }
+     }
+ 
++    public func countIntructionsWith(flags: Instruction.Flags) -> Int {
++        self.filter { instr in
++            instr.flags.contains(flags)
++        }.count
++    }
++
++    /// This is used in the minimizer to clear flags that have been set during minimization.
++    public mutating func clearFlags() {
++        for idx in 0..<self.count {
++            self[idx].flags = .empty
++        }
++    }
++
+     //
+     // Routines for accessing the blocks of a Code object.
+     //
+diff --git a/Sources/Fuzzilli/FuzzIL/Instruction.swift b/Sources/Fuzzilli/FuzzIL/Instruction.swift
+index 80eac2c..d770196 100644
+--- a/Sources/Fuzzilli/FuzzIL/Instruction.swift
++++ b/Sources/Fuzzilli/FuzzIL/Instruction.swift
+@@ -27,9 +27,15 @@ public struct Instruction {
+     ///      First numInputs Variables: inputs
+     ///      Next numOutputs Variables: outputs visible in the outer scope
+     ///      Next numInnerOutputs Variables: outputs only visible in the inner scope created by this instruction
+-    ///      Final value, if present: the index of this instruction in the code object it belongs to
+     private let inouts_: [Variable]
+ 
++    /// The index of this instruction if it belongs to a `Code`, otherwise it is `UInt16.max`.
++    /// In practice, this does not limit the size of programs/code since that's already
++    /// limited by the fact that variables are UInt16 internally.
++    private var indexValue: UInt16 = UInt16.max
++
++    /// The flags associated with this instruction, right now these are mainly used during minimization.
++    public var flags: Self.Flags
+ 
+     /// The number of input variables of this instruction.
+     public var numInputs: Int {
+@@ -132,19 +138,11 @@ public struct Instruction {
+         return inouts_[..<numInouts]
+     }
+ 
+-    /// Whether this instruction contains its index in the code it belongs to.
+-    public var hasIndex: Bool {
+-        // If the index is present, it is the last value in inouts. See comment in index getter.
+-        return inouts_.count == numInouts + 1
+-    }
+-
+-    /// The index of this instruction in the Code it belongs to.
++    /// The index of this instruction in the `Code` it belongs to.
+     public var index: Int {
+-        // We store the index in the internal inouts array for memory efficiency reasons.
+-        // In practice, this does not limit the size of programs/code since that's already
+-        // limited by the fact that variables are UInt16 internally.
+-        assert(hasIndex)
+-        return Int(inouts_.last!.number)
++        // Check that this instruction belongs to a `Code` object, i.e. it has a proper value
++        assert(self.indexValue != UInt16.max)
++        return Int(self.indexValue)
+     }
+ 
+     ///
+@@ -252,45 +250,60 @@ public struct Instruction {
+     }
+ 
+ 
+-    public init<Variables: Collection>(_ op: Operation, inouts: Variables, index: Int? = nil) where Variables.Element == Variable {
++    public init<Variables: Collection>(_ op: Operation, inouts: Variables, index: Int? = nil, flags: Self.Flags) where Variables.Element == Variable {
+         assert(op.numInputs + op.numOutputs + op.numInnerOutputs == inouts.count)
+         self.op = op
+-        var inouts_ = Array(inouts)
++        self.inouts_ = Array(inouts)
+         if let idx = index {
+-            inouts_.append(Variable(number: idx))
++            self.indexValue = UInt16(idx)
+         }
+-        self.inouts_ = inouts_
++        self.flags = flags
+     }
+ 
+     public init(_ op: Operation, output: Variable) {
+         assert(op.numInputs == 0 && op.numOutputs == 1 && op.numInnerOutputs == 0)
+-        self.init(op, inouts: [output])
++        self.init(op, inouts: [output], flags: .empty)
+     }
+ 
+     public init(_ op: Operation, output: Variable, inputs: [Variable]) {
+         assert(op.numOutputs == 1)
+         assert(op.numInnerOutputs == 0)
+         assert(op.numInputs == inputs.count)
+-        self.init(op, inouts: inputs + [output])
++        self.init(op, inouts: inputs + [output], flags: .empty)
+     }
+ 
+     public init(_ op: Operation, inputs: [Variable]) {
+         assert(op.numOutputs + op.numInnerOutputs == 0)
+         assert(op.numInputs == inputs.count)
+-        self.init(op, inouts: inputs)
++        self.init(op, inouts: inputs, flags: .empty)
+     }
+ 
+     public init(_ op: Operation, innerOutput: Variable) {
+         assert(op.numInnerOutputs == 1)
+         assert(op.numOutputs == 0)
+         assert(op.numInputs == 0)
+-        self.init(op, inouts: [innerOutput])
++        self.init(op, inouts: [innerOutput], flags: .empty)
+     }
+ 
+     public init(_ op: Operation) {
+         assert(op.numOutputs + op.numInnerOutputs == 0)
+         assert(op.numInputs == 0)
+-        self.init(op, inouts: [])
++        self.init(op, inouts: [], flags: .empty)
++    }
++
++    /// Flags associated with an Instruction.
++    /// This can be useful to mark instructions in some way, for example during minimization.
++    public struct Flags: OptionSet, CaseIterable {
++        public static var allCases: [Instruction.Flags] = [.notRemovable]
++
++        public let rawValue: UInt16
++
++        public init(rawValue: UInt16) {
++            self.rawValue = rawValue
++        }
++        /// If this is set, the minimizer cannot remove this instruction.
++        public static let notRemovable = Self(rawValue: 1 << 0)
++        public static let empty = Self([])
+     }
+ }
+ 
+@@ -1249,7 +1262,7 @@ extension Instruction: ProtobufConvertible {
+ 
+         opCache?.add(op)
+ 
+-        self.init(op, inouts: inouts)
++        self.init(op, inouts: inouts, flags: .empty)
+     }
+ 
+     init(from proto: ProtobufType) throws {
+diff --git a/Sources/Fuzzilli/FuzzIL/Program.swift b/Sources/Fuzzilli/FuzzIL/Program.swift
+index 94a4dac..57d89fb 100644
+--- a/Sources/Fuzzilli/FuzzIL/Program.swift
++++ b/Sources/Fuzzilli/FuzzIL/Program.swift
+@@ -55,6 +55,8 @@ public final class Program {
+ 
+     /// Construct a program with the given code and type information.
+     public convenience init(code: Code, parent: Program? = nil, comments: ProgramComments = ProgramComments(), contributors: Contributors = Contributors()) {
++        // We should never see instructions with set flags here, as Flags are currently only used temporarily (e.g. Minimizer)
++        assert(code.allSatisfy { instr in instr.flags == Instruction.Flags.empty })
+         self.init(with: code)
+         self.comments = comments
+         self.contributors = contributors
+diff --git a/Sources/Fuzzilli/Minimization/BlockReducer.swift b/Sources/Fuzzilli/Minimization/BlockReducer.swift
+index e1d5873..9d00f83 100644
+--- a/Sources/Fuzzilli/Minimization/BlockReducer.swift
++++ b/Sources/Fuzzilli/Minimization/BlockReducer.swift
+@@ -14,27 +14,27 @@
+ 
+ /// Reducer to remove unecessary block groups.
+ struct BlockReducer: Reducer {
+-    func reduce(_ code: inout Code, with helper: MinimizationHelper) {
++    func reduce(with helper: MinimizationHelper) {
+         /// Here we iterate over the blocks in the code while also changing the code (by removing blocks). This works
+         /// since we are for the most part only nopping out block instructions, not moving them around. In the cases
+         /// where code is moved, only code inside the processed block is moved, and the iteration order visits inner
+         /// blocks before outer blocks.
+         /// As such, the block indices stay valid across these code transformations.
+-        for group in code.findAllBlockGroups() {
+-            switch code[group.head].op.opcode {
++        for group in helper.code.findAllBlockGroups() {
++            switch helper.code[group.head].op.opcode {
+             case .beginObjectLiteral:
+                 assert(group.numBlocks == 1)
+-                reduceObjectLiteral(group.block(0), in: &code, with: helper)
++                reduceObjectLiteral(group.block(0), with: helper)
+ 
+             case .beginObjectLiteralMethod,
+                  .beginObjectLiteralComputedMethod,
+                  .beginObjectLiteralGetter,
+                  .beginObjectLiteralSetter:
+                 assert(group.numBlocks == 1)
+-                reduceFunctionInObjectLiteral(group.block(0), in: &code, with: helper)
++                reduceFunctionInObjectLiteral(group.block(0), with: helper)
+ 
+             case .beginClassDefinition:
+-                reduceClassDefinition(group.block(0), in: &code, with: helper)
++                reduceClassDefinition(group.block(0), with: helper)
+ 
+             case .beginClassConstructor,
+                  .beginClassInstanceMethod,
+@@ -46,7 +46,7 @@ struct BlockReducer: Reducer {
+                  .beginClassStaticSetter,
+                  .beginClassPrivateInstanceMethod,
+                  .beginClassPrivateStaticMethod:
+-                reduceFunctionInClassDefinition(group.block(0), in: &code, with: helper)
++                reduceFunctionInClassDefinition(group.block(0), with: helper)
+ 
+             case .beginWhileLoopHeader,
+                  .beginDoWhileLoopBody,
+@@ -55,16 +55,16 @@ struct BlockReducer: Reducer {
+                  .beginForOfLoop,
+                  .beginForOfLoopWithDestruct,
+                  .beginRepeatLoop:
+-                reduceLoop(group, in: &code, with: helper)
++                reduceLoop(group, with: helper)
+ 
+             case .beginIf:
+-                reduceIfElse(group, in: &code, with: helper)
++                reduceIfElse(group, with: helper)
+ 
+             case .beginTry:
+-                reduceTryCatchFinally(tryCatch: group, in: &code, with: helper)
++                reduceTryCatchFinally(tryCatch: group, with: helper)
+ 
+             case .beginSwitch:
+-                reduceBeginSwitch(group, in: &code, with: helper)
++                reduceBeginSwitch(group, with: helper)
+ 
+             case .beginSwitchCase,
+                  .beginSwitchDefaultCase:
+@@ -72,7 +72,7 @@ struct BlockReducer: Reducer {
+                  break
+ 
+             case .beginWith:
+-                reduceGenericBlockGroup(group, in: &code, with: helper)
++                reduceGenericBlockGroup(group, with: helper)
+ 
+             case .beginPlainFunction,
+                  .beginArrowFunction,
+@@ -81,38 +81,39 @@ struct BlockReducer: Reducer {
+                  .beginAsyncArrowFunction,
+                  .beginAsyncGeneratorFunction,
+                  .beginConstructor:
+-                reduceFunctionOrConstructor(group, in: &code, with: helper)
++                reduceFunctionOrConstructor(group, with: helper)
+ 
+             case .beginCodeString:
+-                reduceCodeString(group, in: &code, with: helper)
++                reduceCodeString(group, with: helper)
+ 
+             case .beginBlockStatement:
+-                reduceGenericBlockGroup(group, in: &code, with: helper)
++                reduceGenericBlockGroup(group, with: helper)
+ 
+             default:
+-                fatalError("Unknown block group: \(code[group.head].op.name)")
++                fatalError("Unknown block group: \(helper.code[group.head].op.name)")
+             }
+         }
+     }
+ 
+-    private func reduceObjectLiteral(_ literal: Block, in code: inout Code, with helper: MinimizationHelper) {
++    private func reduceObjectLiteral(_ literal: Block, with helper: MinimizationHelper) {
+         // The instructions in the body of the object literal aren't valid outside of
+         // object literals, so either remove the entire literal or nothing.
+-        helper.tryNopping(literal.allInstructions, in: &code)
++        helper.tryNopping(literal.allInstructions)
+     }
+ 
+-    private func reduceFunctionInObjectLiteral(_ function: Block, in code: inout Code, with helper: MinimizationHelper) {
++    private func reduceFunctionInObjectLiteral(_ function: Block, with helper: MinimizationHelper) {
+         // The instruction in the body of these functions aren't valid inside the object literal as
+         // they require .javascript context. So either remove the entire function or nothing.
+-        helper.tryNopping(function.allInstructions, in: &code)
++        helper.tryNopping(function.allInstructions)
+     }
+ 
+-    private func reduceClassDefinition(_ definition: Block, in code: inout Code, with helper: MinimizationHelper) {
+-        assert(code[definition.head].op is BeginClassDefinition)
+-        assert(code[definition.tail].op is EndClassDefinition)
++    private func reduceClassDefinition(_ definition: Block, with helper: MinimizationHelper) {
++        assert(helper.code[definition.head].op is BeginClassDefinition)
++        assert(helper.code[definition.tail].op is EndClassDefinition)
+ 
+         // Similar to the object literal case, the instructions in the body aren't valid outside of it, so remove everything.
+-        if helper.tryNopping(definition.allInstructions, in: &code) {
++        if helper.tryNopping(definition.allInstructions) {
++            // Success!
+             return
+         }
+ 
+@@ -143,11 +144,11 @@ struct BlockReducer: Reducer {
+         //     v43 <- CallMethod 'm'
+         //
+         // For that, first collect all field definition instructions and all body instructions into two separate lists
+-        var fieldDefinitionInstructions = [code[definition.head]]
++        var fieldDefinitionInstructions = [helper.code[definition.head]]
+         var bodyInstruction = [Instruction]()
+         // We have to be careful not to include field definitions of nested class definitions here, so go by the current depth to indentify the correct instructions.
+         var depth = 0
+-        for instr in code.body(of: definition) {
++        for instr in helper.code.body(of: definition) {
+             if instr.isBlockEnd {
+                 assert(depth > 0)
+                 depth -= 1
+@@ -161,7 +162,7 @@ struct BlockReducer: Reducer {
+                 depth += 1
+             }
+         }
+-        fieldDefinitionInstructions.append(code[definition.tail])
++        fieldDefinitionInstructions.append(helper.code[definition.tail])
+         if bodyInstruction.isEmpty {
+             // No need to attempt any reordering. This early bail-out is required to ensure minimization terminates.
+             // Otherwise, this reordering would be retried every time, and count as a successful modification of the code.
+@@ -177,23 +178,23 @@ struct BlockReducer: Reducer {
+ 
+         // Code reordering can change the numbering of variables, so they need to be renumbered.
+         // The resulting code may also not be valid since we're moving code out of a method definition.
+-        helper.tryReplacements(replacements, in: &code, renumberVariables: true, expectCodeToBeValid: false)
++        helper.tryReplacements(replacements, renumberVariables: true, expectCodeToBeValid: false)
+     }
+ 
+-    private func reduceFunctionInClassDefinition(_ function: Block, in code: inout Code, with helper: MinimizationHelper) {
++    private func reduceFunctionInClassDefinition(_ function: Block, with helper: MinimizationHelper) {
+         // Similar to the object literal case, the instructions inside the function body aren't valid inside
+         // the surrounding class definition, so we can only try to temove the entire function.
+-        helper.tryNopping(function.allInstructions, in: &code)
++        helper.tryNopping(function.allInstructions)
+     }
+ 
+-    private func reduceLoop(_ loop: BlockGroup, in code: inout Code, with helper: MinimizationHelper) {
++    private func reduceLoop(_ loop: BlockGroup, with helper: MinimizationHelper) {
+         // We reduce loops by removing the loop itself as well as
+         // any 'break' or 'continue' instructions in the loop body.
+         var candidates = loop.blockInstructionIndices
+         var inNestedLoop = false
+         var nestedBlocks = Stack<Bool>()
+         for block in loop.blocks {
+-            for instr in code.body(of: block) {
++            for instr in helper.code.body(of: block) {
+                 if instr.isBlockEnd {
+                    inNestedLoop = nestedBlocks.pop()
+                 }
+@@ -210,15 +211,16 @@ struct BlockReducer: Reducer {
+             assert(nestedBlocks.isEmpty)
+         }
+ 
+-        helper.tryNopping(candidates, in: &code)
++        helper.tryNopping(candidates)
+     }
+ 
+-    private func reduceIfElse(_ group: BlockGroup, in code: inout Code, with helper: MinimizationHelper) {
+-        assert(code[group.head].op is BeginIf)
+-        assert(code[group.tail].op is EndIf)
++    private func reduceIfElse(_ group: BlockGroup, with helper: MinimizationHelper) {
++        assert(helper.code[group.head].op is BeginIf)
++        assert(helper.code[group.tail].op is EndIf)
+ 
+         // First try to remove the entire if-else block but keep its content.
+-        if helper.tryNopping(group.blockInstructionIndices, in: &code) {
++        if helper.tryNopping(group.blockInstructionIndices) {
++            // Success!
+             return
+         }
+ 
+@@ -227,29 +229,30 @@ struct BlockReducer: Reducer {
+             // First try to remove the else block.
+             let elseBlock = group.block(1)
+             let rangeToNop = Array(elseBlock.head ..< elseBlock.tail)
+-            if helper.tryNopping(rangeToNop, in: &code) {
++            if helper.tryNopping(rangeToNop) {
++                // Success!
+                 return
+             }
+ 
+             // Then try to remove the if block. This requires inverting the condition of the if.
+             let ifBlock = group.block(0)
+-            let beginIf = code[ifBlock.head].op as! BeginIf
++            let beginIf = helper.code[ifBlock.head].op as! BeginIf
+             let invertedIf = BeginIf(inverted: !beginIf.inverted)
+             var replacements = [(Int, Instruction)]()
+-            replacements.append((ifBlock.head, Instruction(invertedIf, inouts: code[ifBlock.head].inouts)))
++            replacements.append((ifBlock.head, Instruction(invertedIf, inouts: helper.code[ifBlock.head].inouts, flags: .empty)))
+             // The rest of the if body is nopped ...
+-            for instr in code.body(of: ifBlock) {
++            for instr in helper.code.body(of: ifBlock) {
+                 replacements.append((instr.index, helper.nop(for: instr)))
+             }
+             // ... as well as the BeginElse.
+             replacements.append((elseBlock.head, Instruction(Nop())))
+-            helper.tryReplacements(replacements, in: &code)
++            helper.tryReplacements(replacements)
+         }
+     }
+ 
+-    private func reduceGenericBlockGroup(_ group: BlockGroup, in code: inout Code, with helper: MinimizationHelper) {
++    private func reduceGenericBlockGroup(_ group: BlockGroup, with helper: MinimizationHelper) {
+         var candidates = group.blockInstructionIndices
+-        if helper.tryNopping(candidates, in: &code) {
++        if helper.tryNopping(candidates) {
+             // Success!
+             return
+         }
+@@ -272,19 +275,19 @@ struct BlockReducer: Reducer {
+         // can be removed independently, since they have data dependencies on each other. As such,
+         // the only option is to remove the entire block, including its content.
+         candidates = group.instructionIndices
+-        helper.tryNopping(candidates, in: &code)
++        helper.tryNopping(candidates)
+     }
+ 
+     // Try to reduce a BeginSwitch/EndSwitch Block.
+     // (1) reduce it by aggressively trying to remove the whole thing.
+     // (2) reduce it by removing the BeginSwitch(Default)Case/EndSwitchCase instructions but keeping the content.
+     // (3) reduce it by removing individual BeginSwitchCase/EndSwitchCase blocks.
+-    private func reduceBeginSwitch(_ group: BlockGroup, in code: inout Code, with helper: MinimizationHelper) {
+-        assert(code[group.head].op is BeginSwitch)
++    private func reduceBeginSwitch(_ group: BlockGroup, with helper: MinimizationHelper) {
++        assert(helper.code[group.head].op is BeginSwitch)
+ 
+         var candidates = group.instructionIndices
+ 
+-        if helper.tryNopping(candidates, in: &code) {
++        if helper.tryNopping(candidates) {
+             // (1)
+             // We successfully removed the whole switch statement.
+             return
+@@ -299,8 +302,8 @@ struct BlockReducer: Reducer {
+         // Start iterating over the switch case statements.
+         var instructionIdx = group.head+1
+         while instructionIdx < group.tail {
+-            if code[instructionIdx].op is BeginSwitchCase || code[instructionIdx].op is BeginSwitchDefaultCase {
+-                let block = code.block(startingAt: instructionIdx)
++            if helper.code[instructionIdx].op is BeginSwitchCase || helper.code[instructionIdx].op is BeginSwitchDefaultCase {
++                let block = helper.code.block(startingAt: instructionIdx)
+                 blocks.append(block)
+                 candidates.append(block.head)
+                 candidates.append(block.tail)
+@@ -310,7 +313,7 @@ struct BlockReducer: Reducer {
+             instructionIdx += 1
+         }
+ 
+-        if helper.tryNopping(candidates, in: &code) {
++        if helper.tryNopping(candidates) {
+             // (2)
+             // We successfully removed the switch case while keeping the
+             // content inside.
+@@ -319,13 +322,13 @@ struct BlockReducer: Reducer {
+ 
+         for block in blocks {
+             // (3) Try to remove the cases here.
+-            helper.tryNopping(block.allInstructions, in: &code)
++            helper.tryNopping(block.allInstructions)
+         }
+     }
+ 
+-    private func reduceFunctionOrConstructor(_ function: BlockGroup, in code: inout Code, with helper: MinimizationHelper) {
+-        assert(code[function.head].op is BeginAnySubroutine)
+-        assert(code[function.tail].op is EndAnySubroutine)
++    private func reduceFunctionOrConstructor(_ function: BlockGroup, with helper: MinimizationHelper) {
++        assert(helper.code[function.head].op is BeginAnySubroutine)
++        assert(helper.code[function.tail].op is EndAnySubroutine)
+ 
+         // Only attempt generic block group reduction and rely on the InliningReducer to handle more complex scenarios.
+         // Alternatively, we could also attempt to turn
+@@ -342,42 +345,44 @@ struct BlockReducer: Reducer {
+         //
+         // So that the calls to the function can be removed by a subsequent reducer if only the body is important.
+         // But its likely not worth the effort as the InliningReducer will do a better job at solving this.
+-        reduceGenericBlockGroup(function, in: &code, with: helper)
++        reduceGenericBlockGroup(function, with: helper)
+     }
+ 
+-    private func reduceCodeString(_ codestring: BlockGroup, in code: inout Code, with helper: MinimizationHelper) {
+-        assert(code[codestring.head].op is BeginCodeString)
+-        assert(code[codestring.tail].op is EndCodeString)
++    private func reduceCodeString(_ codestring: BlockGroup, with helper: MinimizationHelper) {
++        assert(helper.code[codestring.head].op is BeginCodeString)
++        assert(helper.code[codestring.tail].op is EndCodeString)
+ 
+         // To remove CodeStrings, we replace the BeginCodeString with a LoadString operation and the EndCodeString with a Nop.
+         // This way, the code inside the CodeString will execute directly and any following `eval()` call on that CodeString
+         // will effectively become a Nop (and will hopefully be removed afterwards).
+         // This avoids the need to find the `eval` call that use the CodeString.
++        // Indices stay valid throughout this reduction.
+         var replacements = [(Int, Instruction)]()
+-        replacements.append((codestring.head, Instruction(LoadString(value: ""), output: code[codestring.head].output)))
++        replacements.append((codestring.head, Instruction(LoadString(value: ""), output: helper.code[codestring.head].output)))
+         replacements.append((codestring.tail, Instruction(Nop())))
+-        if helper.tryReplacements(replacements, in: &code) {
++        if helper.tryReplacements(replacements) {
+             // Success!
+             return
+         }
+ 
+         // If unsuccessful, default to generic block reduction
+-        reduceGenericBlockGroup(codestring, in: &code, with: helper)
++        reduceGenericBlockGroup(codestring, with: helper)
+     }
+ 
+-    private func reduceTryCatchFinally(tryCatch: BlockGroup, in code: inout Code, with helper: MinimizationHelper) {
+-        assert(code[tryCatch.head].op is BeginTry)
+-        assert(code[tryCatch.tail].op is EndTryCatchFinally)
++    private func reduceTryCatchFinally(tryCatch: BlockGroup, with helper: MinimizationHelper) {
++        assert(helper.code[tryCatch.head].op is BeginTry)
++        assert(helper.code[tryCatch.tail].op is EndTryCatchFinally)
+ 
+         // First we try to remove only the try-catch-finally block instructions.
+         var candidates = tryCatch.blockInstructionIndices
+ 
+-        if helper.tryNopping(candidates, in: &code) {
++        if helper.tryNopping(candidates) {
++            // Success!
+             return
+         }
+ 
+         let tryBlock = tryCatch.block(0)
+-        assert(code[tryBlock.head].op is BeginTry)
++        assert(helper.code[tryBlock.head].op is BeginTry)
+ 
+         // If that doesn't work, then we try to remove the block instructions
+         // and the last instruction of the try block but keep everything else.
+@@ -404,8 +409,8 @@ struct BlockReducer: Reducer {
+         var removedLastTryBlockInstruction = false
+         // Find the last instruction in try block and try removing that as well.
+         for i in stride(from: tryBlock.tail - 1, to: tryBlock.head, by: -1) {
+-            if !(code[i].op is Nop) {
+-                if !code[i].isBlock {
++            if !(helper.code[i].op is Nop) {
++                if !helper.code[i].isBlock {
+                     candidates.append(i)
+                     removedLastTryBlockInstruction = true
+                 }
+@@ -413,8 +418,11 @@ struct BlockReducer: Reducer {
+             }
+         }
+ 
+-        if removedLastTryBlockInstruction && helper.tryNopping(candidates, in: &code) {
+-            return
++        if removedLastTryBlockInstruction {
++            if helper.tryNopping(candidates) {
++                // Success!
++                return
++            }
+         }
+ 
+         // If that still didn't work, try removing the entire try-block.
+@@ -435,15 +443,18 @@ struct BlockReducer: Reducer {
+ 
+         // Remove all instructions in the body of the try block
+         for i in stride(from: tryBlock.tail - 1, to: tryBlock.head, by: -1) {
+-            if !(code[i].op is Nop) {
++            if !(helper.code[i].op is Nop) {
+                 candidates.append(i)
+             }
+         }
+ 
+-        helper.tryNopping(candidates, in: &code)
++        if helper.tryNopping(candidates) {
++            // Success!
++            return
++        }
+ 
+         // Finally, fall back to generic block group reduction, which will attempt to remove the
+         // entire try-catch block including its content
+-        reduceGenericBlockGroup(tryCatch, in: &code, with: helper)
++        reduceGenericBlockGroup(tryCatch, with: helper)
+     }
+ }
+diff --git a/Sources/Fuzzilli/Minimization/DeduplicatingReducer.swift b/Sources/Fuzzilli/Minimization/DeduplicatingReducer.swift
+index cde8bf2..c9effe3 100644
+--- a/Sources/Fuzzilli/Minimization/DeduplicatingReducer.swift
++++ b/Sources/Fuzzilli/Minimization/DeduplicatingReducer.swift
+@@ -14,7 +14,7 @@
+ 
+ // Attempts deduplicate variables containing the same values.
+ struct DeduplicatingReducer: Reducer {
+-    func reduce(_ code: inout Code, with helper: MinimizationHelper) {
++    func reduce(with helper: MinimizationHelper) {
+         // Currently we only handle LoadBuiltin, but the code could easily be
+         // extended to cover other types of values as well.
+         // It's not obvious however which other values would benefit from this.
+@@ -31,12 +31,12 @@ struct DeduplicatingReducer: Reducer {
+         var deduplicatedVariables = VariableMap<Variable>()
+         var visibleBuiltins = Stack<[String]>([[]])
+         var variableForBuiltin = [String: Variable]()
+-        for instr in code {
++        for instr in helper.code {
+             // Instruction replacement.
+             let oldInouts = Array(instr.inouts)
+             let newInouts = oldInouts.map({ deduplicatedVariables[$0] ?? $0 })
+             if oldInouts != newInouts {
+-                replacements.append((instr.index, Instruction(instr.op, inouts: newInouts)))
++                replacements.append((instr.index, Instruction(instr.op, inouts: newInouts, flags: instr.flags)))
+             }
+ 
+             // Scope management.
+@@ -63,7 +63,7 @@ struct DeduplicatingReducer: Reducer {
+         }
+ 
+         if !replacements.isEmpty {
+-            helper.tryReplacements(replacements, in: &code)
++            helper.tryReplacements(replacements)
+         }
+     }
+ }
+diff --git a/Sources/Fuzzilli/Minimization/GenericInstructionReducer.swift b/Sources/Fuzzilli/Minimization/GenericInstructionReducer.swift
+index 345feb3..5b50251 100644
+--- a/Sources/Fuzzilli/Minimization/GenericInstructionReducer.swift
++++ b/Sources/Fuzzilli/Minimization/GenericInstructionReducer.swift
+@@ -14,13 +14,13 @@
+ 
+ /// Removes simple instructions from a program if they are not required.
+ struct GenericInstructionReducer: Reducer {
+-    func reduce(_ code: inout Code, with helper: MinimizationHelper) {
+-        for instr in code.reversed() {
++    func reduce(with helper: MinimizationHelper) {
++        for instr in helper.code.reversed() {
+             if !instr.isSimple || instr.op is Nop {
+                 continue
+             }
+ 
+-            helper.tryNopping(instructionAt: instr.index, in: &code)
++            helper.tryNopping(instructionAt: instr.index)
+         }
+     }
+ }
+diff --git a/Sources/Fuzzilli/Minimization/InliningReducer.swift b/Sources/Fuzzilli/Minimization/InliningReducer.swift
+index 2c461aa..10801da 100644
+--- a/Sources/Fuzzilli/Minimization/InliningReducer.swift
++++ b/Sources/Fuzzilli/Minimization/InliningReducer.swift
+@@ -14,17 +14,16 @@
+ 
+ /// Attempts to inline functions at their callsite. This reducer is necessary to prevent deep nesting of functions.
+ struct InliningReducer: Reducer {
+-    func reduce(_ code: inout Code, with helper: MinimizationHelper) {
+-        var candidates = identifyInlineableFunctions(in: code)
++    func reduce(with helper: MinimizationHelper) {
++        var candidates = identifyInlineableFunctions(in: helper.code)
+         while !candidates.isEmpty {
+             let funcIndex = candidates.removeLast()
+-            let newCode = inline(functionAt: funcIndex, in: code)
+-            if helper.test(newCode) {
+-                code = newCode
++            let newCode = inline(functionAt: funcIndex, in: helper.code)
++            if helper.testAndCommit(newCode) {
+                 // Inlining changes the program so we need to redo our analysis.
+                 // In particular, instruction are reordered and variables are renamed. Further, there may now also be new inlining candidates, for example
+                 // if another function could previously not be inlined because it was used as argument or return value of a now inlined function).
+-                candidates = identifyInlineableFunctions(in: code)
++                candidates = identifyInlineableFunctions(in: helper.code)
+             }
+         }
+     }
+@@ -148,7 +147,6 @@ struct InliningReducer: Reducer {
+         }
+ 
+         let funcDefinition = code[i]
+-        assert(funcDefinition.op is BeginAnyFunction)
+         let function = funcDefinition.output
+         let parameters = Array(funcDefinition.innerOutputs)
+ 
+@@ -217,7 +215,7 @@ struct InliningReducer: Reducer {
+         var functionDefinitionDepth = 0
+         for instr in functionBody {
+             let newInouts = instr.inouts.map { arguments[$0] ?? $0 }
+-            let newInstr = Instruction(instr.op, inouts: newInouts)
++            let newInstr = Instruction(instr.op, inouts: newInouts, flags: instr.flags)
+ 
+             // Returns (from the function being inlined) are converted to assignments to the return value.
+             if instr.op is Return && functionDefinitionDepth == 0 {
+diff --git a/Sources/Fuzzilli/Minimization/LoopReducer.swift b/Sources/Fuzzilli/Minimization/LoopReducer.swift
+index 80ba3b3..30cf2ad 100644
+--- a/Sources/Fuzzilli/Minimization/LoopReducer.swift
++++ b/Sources/Fuzzilli/Minimization/LoopReducer.swift
+@@ -26,35 +26,35 @@ struct LoopReducer: Reducer {
+     // (if e.g. the loop is necessary to trigger JIT compilation) and so we test each reduction multiple times.
+     private let numTestExecutions = 3
+ 
+-    func reduce(_ code: inout Code, with helper: MinimizationHelper) {
++    func reduce(with helper: MinimizationHelper) {
+         /// Here we keep blocks (i.e. something like an iterator) in use even while changing the underlying code.
+         /// This works because the iteration order visits inner blocks before outer blocks, so we will never change
+         /// block instructions that we will visit later on.
+-        for group in code.findAllBlockGroups() {
+-            switch code[group.head].op.opcode {
++        for group in helper.code.findAllBlockGroups() {
++            switch helper.code[group.head].op.opcode {
+             case .beginForLoopInitializer:
+-                tryReplaceForLoopWithRepeatLoop(group, in: &code, with: helper)
++                tryReplaceForLoopWithRepeatLoop(group, with: helper)
+             case .beginWhileLoopHeader:
+-                tryReplaceWhileLoopWithRepeatLoop(group, in: &code, with: helper)
++                tryReplaceWhileLoopWithRepeatLoop(group, with: helper)
+             case .beginDoWhileLoopBody:
+-                tryReplaceDoWhileLoopWithRepeatLoop(group, in: &code, with: helper)
++                tryReplaceDoWhileLoopWithRepeatLoop(group, with: helper)
+             case .beginRepeatLoop:
+-                tryReduceRepeatLoopIterationCount(group, in: &code, with: helper)
++                tryReduceRepeatLoopIterationCount(group, with: helper)
+             case .beginForInLoop,
+                     .beginForOfLoop,
+                     .beginForOfLoopWithDestruct:
+                 // These loops are (usually) guaranteed to terminate, and should probably anyway not be replaced by repeat-loops.
+                 break
+             default:
+-                assert(group.blocks.allSatisfy({ !code[$0.head].op.contextOpened.contains(.loop) }))
++                assert(group.blocks.allSatisfy({ !helper.code[$0.head].op.contextOpened.contains(.loop) }))
+             }
+         }
+ 
+         // Try merging nested loops now, after potentially converting other loop types to simple repeat loops.
+-        findAndMergeNestedRepeatLoops(in: &code, with: helper)
++        findAndMergeNestedRepeatLoops(with: helper)
+     }
+ 
+-    private func tryReplaceForLoopWithRepeatLoop(_ group: BlockGroup, in code: inout Code, with helper: MinimizationHelper) {
++    private func tryReplaceForLoopWithRepeatLoop(_ group: BlockGroup, with helper: MinimizationHelper) {
+         // Turn
+         //
+         //      BeginForLoopInitializer
+@@ -81,50 +81,50 @@ struct LoopReducer: Reducer {
+ 
+         // Append initializer code
+         let initializerBlock = group.block(0)
+-        assert(code[initializerBlock.head].op is BeginForLoopInitializer)
+-        for instr in code.body(of: initializerBlock) {
++        assert(helper.code[initializerBlock.head].op is BeginForLoopInitializer)
++        for instr in helper.code.body(of: initializerBlock) {
+             newCode.append(instr)
+         }
+ 
+         // Append loop header
+         let conditionBlock = group.block(1)
+-        let beginConditionBlock = code[conditionBlock.head]
++        let beginConditionBlock = helper.code[conditionBlock.head]
+         assert(beginConditionBlock.op is BeginForLoopCondition)
+         let headerIndex = newCode.count
+         let needLoopVariable = beginConditionBlock.numInnerOutputs > 0
+         let loopVar = needLoopVariable ? beginConditionBlock.innerOutput(0) : nil
+-        newCode.append(Instruction(BeginRepeatLoop(iterations: 1, exposesLoopCounter: needLoopVariable), inouts: needLoopVariable ? [loopVar!] : []))
++        newCode.append(Instruction(BeginRepeatLoop(iterations: 1, exposesLoopCounter: needLoopVariable), inouts: needLoopVariable ? [loopVar!] : [], flags: .empty))
+ 
+         // Append condition, body, and afterthought code
+         var replacements = Dictionary<Variable, Variable>(uniqueKeysWithValues: beginConditionBlock.innerOutputs.map({ ($0, loopVar!) }))
+-        for instr in code.body(of: conditionBlock) {
++        for instr in helper.code.body(of: conditionBlock) {
+             let newInouts = instr.inouts.map({ replacements[$0] ?? $0 })
+-            newCode.append(Instruction(instr.op, inouts: newInouts))
++            newCode.append(Instruction(instr.op, inouts: newInouts, flags: .empty))
+         }
+ 
+         let bodyBlock = group.block(3)
+-        assert(code[bodyBlock.head].op is BeginForLoopBody)
+-        replacements = Dictionary<Variable, Variable>(uniqueKeysWithValues: code[bodyBlock.head].innerOutputs.map({ ($0, loopVar!) }))
+-        for instr in code.body(of: bodyBlock) {
++        assert(helper.code[bodyBlock.head].op is BeginForLoopBody)
++        replacements = Dictionary<Variable, Variable>(uniqueKeysWithValues: helper.code[bodyBlock.head].innerOutputs.map({ ($0, loopVar!) }))
++        for instr in helper.code.body(of: bodyBlock) {
+             let newInouts = instr.inouts.map({ replacements[$0] ?? $0 })
+-            newCode.append(Instruction(instr.op, inouts: newInouts))
++            newCode.append(Instruction(instr.op, inouts: newInouts, flags: .empty))
+         }
+ 
+         let afterthoughtBlock = group.block(2)
+-        assert(code[afterthoughtBlock.head].op is BeginForLoopAfterthought)
+-        replacements = Dictionary<Variable, Variable>(uniqueKeysWithValues: code[afterthoughtBlock.head].innerOutputs.map({ ($0, loopVar!) }))
+-        for instr in code.body(of: afterthoughtBlock) {
++        assert(helper.code[afterthoughtBlock.head].op is BeginForLoopAfterthought)
++        replacements = Dictionary<Variable, Variable>(uniqueKeysWithValues: helper.code[afterthoughtBlock.head].innerOutputs.map({ ($0, loopVar!) }))
++        for instr in helper.code.body(of: afterthoughtBlock) {
+             let newInouts = instr.inouts.map({ replacements[$0] ?? $0 })
+-            newCode.append(Instruction(instr.op, inouts: newInouts))
++            newCode.append(Instruction(instr.op, inouts: newInouts, flags: .empty))
+         }
+ 
+         // Append loop footer
+         newCode.append(Instruction(EndRepeatLoop()))
+ 
+-        tryReplacingWithShortestPossibleRepeatLoop(range: group.head...group.tail, in: &code, with: &newCode, loopHeaderIndexInNewCode: headerIndex, using: helper)
++        tryReplacingWithShortestPossibleRepeatLoop(range: group.head...group.tail, with: newCode, loopHeaderIndexInNewCode: headerIndex, using: helper)
+     }
+ 
+-    private func tryReplaceWhileLoopWithRepeatLoop(_ group: BlockGroup, in code: inout Code, with helper: MinimizationHelper) {
++    private func tryReplaceWhileLoopWithRepeatLoop(_ group: BlockGroup, with helper: MinimizationHelper) {
+         // Turn
+         //
+         //      BeginWhileLoopHeader
+@@ -147,24 +147,24 @@ struct LoopReducer: Reducer {
+ 
+         // Append loop header and body code
+         let headerBlock = group.block(0)
+-        assert(code[headerBlock.head].op is BeginWhileLoopHeader)
+-        for instr in code.body(of: headerBlock) {
++        assert(helper.code[headerBlock.head].op is BeginWhileLoopHeader)
++        for instr in helper.code.body(of: headerBlock) {
+             newCode.append(instr)
+         }
+ 
+         let bodyBlock = group.block(1)
+-        assert(code[bodyBlock.head].op is BeginWhileLoopBody)
+-        for instr in code.body(of: bodyBlock) {
++        assert(helper.code[bodyBlock.head].op is BeginWhileLoopBody)
++        for instr in helper.code.body(of: bodyBlock) {
+             newCode.append(instr)
+         }
+ 
+         // Append loop footer
+         newCode.append(Instruction(EndRepeatLoop()))
+ 
+-        tryReplacingWithShortestPossibleRepeatLoop(range: group.head...group.tail, in: &code, with: &newCode, loopHeaderIndexInNewCode: 0, using: helper)
++        tryReplacingWithShortestPossibleRepeatLoop(range: group.head...group.tail, with: newCode, loopHeaderIndexInNewCode: 0, using: helper)
+     }
+ 
+-    private func tryReplaceDoWhileLoopWithRepeatLoop(_ group: BlockGroup, in code: inout Code, with helper: MinimizationHelper) {
++    private func tryReplaceDoWhileLoopWithRepeatLoop(_ group: BlockGroup, with helper: MinimizationHelper) {
+         // Turn
+         //
+         //      BeginDoWhileLoopBody
+@@ -187,25 +187,25 @@ struct LoopReducer: Reducer {
+ 
+         // Append loop body and header code
+         let bodyBlock = group.block(0)
+-        assert(code[bodyBlock.head].op is BeginDoWhileLoopBody)
+-        for instr in code.body(of: bodyBlock) {
++        assert(helper.code[bodyBlock.head].op is BeginDoWhileLoopBody)
++        for instr in helper.code.body(of: bodyBlock) {
+             newCode.append(instr)
+         }
+ 
+         let headerBlock = group.block(1)
+-        assert(code[headerBlock.head].op is BeginDoWhileLoopHeader)
+-        for instr in code.body(of: headerBlock) {
++        assert(helper.code[headerBlock.head].op is BeginDoWhileLoopHeader)
++        for instr in helper.code.body(of: headerBlock) {
+             newCode.append(instr)
+         }
+ 
+         // Append loop footer
+         newCode.append(Instruction(EndRepeatLoop()))
+ 
+-        tryReplacingWithShortestPossibleRepeatLoop(range: group.head...group.tail, in: &code, with: &newCode, loopHeaderIndexInNewCode: 0, using: helper)
++        tryReplacingWithShortestPossibleRepeatLoop(range: group.head...group.tail, with: newCode, loopHeaderIndexInNewCode: 0, using: helper)
+     }
+ 
+-    private func tryReduceRepeatLoopIterationCount(_ group: BlockGroup, in code: inout Code, with helper: MinimizationHelper) {
+-        let originalLoopHeader = code[group.head].op as! BeginRepeatLoop
++    private func tryReduceRepeatLoopIterationCount(_ group: BlockGroup, with helper: MinimizationHelper) {
++        let originalLoopHeader = helper.code[group.head].op as! BeginRepeatLoop
+         guard originalLoopHeader.iterations > commonLoopIterationCounts[0] else {
+             // Loop already has the minimum number of iterations.
+             return
+@@ -217,33 +217,34 @@ struct LoopReducer: Reducer {
+             }
+             let replacement: Instruction
+             if originalLoopHeader.exposesLoopCounter {
+-                replacement = Instruction(BeginRepeatLoop(iterations: numIterations, exposesLoopCounter: true), inouts: code[group.head].inouts)
++                replacement = Instruction(BeginRepeatLoop(iterations: numIterations, exposesLoopCounter: true), inouts: helper.code[group.head].inouts, flags: .empty)
+             } else {
+                 replacement = Instruction(BeginRepeatLoop(iterations: numIterations, exposesLoopCounter: false))
+             }
+-            if helper.tryReplacing(instructionAt: group.head, with: replacement, in: &code, numExecutions: numTestExecutions) {
++            if helper.tryReplacing(instructionAt: group.head, with: replacement, numExecutions: numTestExecutions) {
+                 return
+             }
+         }
+     }
+ 
+-    private func tryReplacingWithShortestPossibleRepeatLoop(range: ClosedRange<Int>, in code: inout Code, with newCode: inout [Instruction], loopHeaderIndexInNewCode headerIndex: Int, using helper: MinimizationHelper) {
++    private func tryReplacingWithShortestPossibleRepeatLoop(range: ClosedRange<Int>, with newCode: [Instruction], loopHeaderIndexInNewCode headerIndex: Int, using helper: MinimizationHelper) {
++        var newCode = newCode
+         assert(newCode[headerIndex].op is BeginRepeatLoop)
+         for numIterations in commonLoopIterationCounts {
+             if newCode[headerIndex].numInnerOutputs > 0 {
+-                newCode[headerIndex] = Instruction(BeginRepeatLoop(iterations: numIterations, exposesLoopCounter: true), inouts: newCode[headerIndex].inouts)
++                newCode[headerIndex] = Instruction(BeginRepeatLoop(iterations: numIterations, exposesLoopCounter: true), inouts: newCode[headerIndex].inouts, flags: .empty)
+             } else {
+                 newCode[headerIndex] = Instruction(BeginRepeatLoop(iterations: numIterations, exposesLoopCounter: false))
+             }
+             // After this change, the variable numbers may no longer be sequential as we may have removed instructions with inner outputs. So we need to also renumber the variables.
+-            if helper.tryReplacing(range: range, in: &code, with: newCode, renumberVariables: true, numExecutions: numTestExecutions) {
++            if helper.tryReplacing(range: range, with: newCode, renumberVariables: true, numExecutions: numTestExecutions) {
+                 return
+             }
+         }
+         return
+     }
+ 
+-    private func findAndMergeNestedRepeatLoops(in code: inout Code, with helper: MinimizationHelper) {
++    private func findAndMergeNestedRepeatLoops(with helper: MinimizationHelper) {
+         // We consider a loop a nested loop if it is directly inside another loop, with only nops in between.
+         // For example:
+         //
+@@ -267,7 +268,7 @@ struct LoopReducer: Reducer {
+         //
+         // Would.
+         var loops = [Block]()
+-        for group in code.findAllBlockGroups() where code[group.head].op is BeginRepeatLoop {
++        for group in helper.code.findAllBlockGroups() where helper.code[group.head].op is BeginRepeatLoop {
+             assert(group.numBlocks == 1)
+             loops.append(group.block(0))
+         }
+@@ -275,26 +276,26 @@ struct LoopReducer: Reducer {
+         var nestedLoops = [(outerHead: Int, innerHead: Int, innerTail: Int, outerTail: Int)]()
+         for (i, outerLoop) in loops.dropLast().enumerated() {
+             let innerLoop = loops[i + 1]
+-            let instructionsBeforeInnerLoop = code[code.index(after: outerLoop.head)..<innerLoop.head]
++            let instructionsBeforeInnerLoop = helper.code[helper.code.index(after: outerLoop.head)..<innerLoop.head]
+             guard !instructionsBeforeInnerLoop.contains(where: { !($0.op is Nop) }) else { break }
+-            let instructionsAfterInnerLoop = code[code.index(after: innerLoop.tail)..<outerLoop.tail]
++            let instructionsAfterInnerLoop = helper.code[helper.code.index(after: innerLoop.tail)..<outerLoop.tail]
+             guard !instructionsAfterInnerLoop.contains(where: { !($0.op is Nop) }) else { break }
+             nestedLoops.append((outerLoop.head, innerLoop.head, innerLoop.tail, outerLoop.tail))
+         }
+ 
+         for nestedLoop in nestedLoops {
+-            guard code[nestedLoop.outerHead].op is BeginRepeatLoop else {
++            guard helper.code[nestedLoop.outerHead].op is BeginRepeatLoop else {
+                 // This means the outer loop has itself been merged with another loop
+                 continue
+             }
+-            tryMergeNestedRepeatLoops(outerHead: nestedLoop.outerHead, innerHead: nestedLoop.innerHead, innerTail: nestedLoop.innerTail, outerTail: nestedLoop.outerTail, in: &code, with: helper)
++            tryMergeNestedRepeatLoops(outerHead: nestedLoop.outerHead, innerHead: nestedLoop.innerHead, innerTail: nestedLoop.innerTail, outerTail: nestedLoop.outerTail, with: helper)
+         }
+     }
+ 
+-    private func tryMergeNestedRepeatLoops(outerHead: Int, innerHead: Int, innerTail: Int, outerTail: Int, in code: inout Code, with helper: MinimizationHelper) {
++    private func tryMergeNestedRepeatLoops(outerHead: Int, innerHead: Int, innerTail: Int, outerTail: Int, with helper: MinimizationHelper) {
+         assert(outerHead < innerHead && innerHead < innerTail && innerTail < outerTail)
+-        let outer = code[outerHead].op as! BeginRepeatLoop
+-        let inner = code[innerHead].op as! BeginRepeatLoop
++        let outer = helper.code[outerHead].op as! BeginRepeatLoop
++        let inner = helper.code[innerHead].op as! BeginRepeatLoop
+         let newHead = BeginRepeatLoop(iterations: outer.iterations * inner.iterations, exposesLoopCounter: outer.exposesLoopCounter || inner.exposesLoopCounter)
+ 
+         var replacements = [(Int, Instruction)]()
+@@ -307,24 +308,24 @@ struct LoopReducer: Reducer {
+         } else if !outer.exposesLoopCounter || !inner.exposesLoopCounter {
+             // Another simple case: only need to replace the loop instructions and reuse the one existing loop counter variable
+             assert(newHead.exposesLoopCounter)
+-            let loopVar = outer.exposesLoopCounter ? code[outerHead].innerOutput : code[innerHead].innerOutput
++            let loopVar = outer.exposesLoopCounter ? helper.code[outerHead].innerOutput : helper.code[innerHead].innerOutput
+             replacements.append((outerHead, Instruction(newHead, innerOutput: loopVar)))
+         } else {
+             // The more complicated case: we also need to rebind references to the inner loop's counter variable to the new counter variable
+-            let loopVar = code[outerHead].innerOutput
++            let loopVar = helper.code[outerHead].innerOutput
+             replacements.append((outerHead, Instruction(newHead, innerOutput: loopVar)))
+ 
+-            let innerLoopVar = code[innerHead].innerOutput
+-            for instr in code[innerHead..<innerTail] {
++            let innerLoopVar = helper.code[innerHead].innerOutput
++            for instr in helper.code[innerHead..<innerTail] {
+                 if instr.inputs.contains(innerLoopVar) {
+                     let newInouts = instr.inouts.map({ $0 == innerLoopVar ? loopVar : $0 })
+-                    let replacement = Instruction(instr.op, inouts: newInouts)
++                    let replacement = Instruction(instr.op, inouts: newInouts, flags: .empty)
+                     replacements.append((instr.index, replacement))
+                 }
+             }
+         }
+ 
+         // We may have changed the order of variable declarations, so we need to renumber the variables.
+-        helper.tryReplacements(replacements, in: &code, renumberVariables: true, numExecutions: numTestExecutions)
++        helper.tryReplacements(replacements, renumberVariables: true, numExecutions: numTestExecutions)
+     }
+ }
+diff --git a/Sources/Fuzzilli/Minimization/MinimizationHelper.swift b/Sources/Fuzzilli/Minimization/MinimizationHelper.swift
+index e89d6b9..d033a10 100644
+--- a/Sources/Fuzzilli/Minimization/MinimizationHelper.swift
++++ b/Sources/Fuzzilli/Minimization/MinimizationHelper.swift
+@@ -24,20 +24,28 @@ class MinimizationHelper {
+     /// The aspects of the program to preserve during minimization.
+     private let aspects: ProgramAspects
+ 
++    /// The code that is being reduced.
++    /// All methods essentially modify this code.
++    /// The Minimizer then takes this out of helper with `.finalize()`
++    private(set) var code: Code
++
++    /// This signals that the code is not expected to be changed anymore.
++    private var finalized = false
++
++    /// The number of unconditionally kept instructions in this program.
++    private(set) var numKeptInstructions = 0
++
+     /// Whether we are running on the fuzzer queue (synchronous minimization) or not (asynchronous minimization).
+     private let runningOnFuzzerQueue: Bool
+ 
+-    /// The minimizer can select instructions that should be kept regardless of whether they are important or not. This set tracks those instructions.
+-    private var instructionsToKeep: Set<Int>
+-
+     /// How many times we execute the modified code by default to determine whether its (relevant) behaviour has changed due to a modification.
+     private static let defaultNumExecutions = 1
+ 
+-    init(for aspects: ProgramAspects, of fuzzer: Fuzzer, keeping instructionsToKeep: Set<Int>, runningOnFuzzerQueue: Bool) {
++    init(for aspects: ProgramAspects, forCode code: Code, of fuzzer: Fuzzer, runningOnFuzzerQueue: Bool) {
+         self.aspects = aspects
+         self.fuzzer = fuzzer
+-        self.instructionsToKeep = instructionsToKeep
+         self.runningOnFuzzerQueue = runningOnFuzzerQueue
++        self.code = code
+     }
+ 
+     func performOnFuzzerQueue(_ task: () -> Void) {
+@@ -48,14 +56,65 @@ class MinimizationHelper {
+         }
+     }
+ 
+-    func clearInstructionsToKeep() {
+-        instructionsToKeep.removeAll()
++    func applyMinimizationLimit(limit minimizationLimit: Double) {
++        assert(!self.finalized)
++        // Implementation of minimization limits:
++        // Pick N (~= minimizationLimit * programSize) instructions at random which will not be removed during minimization.
++        // This way, minimization will be sped up (because no executions are necessary for those instructions marked as keep-alive)
++        // while the instructions that are kept artificially are equally distributed throughout the program.
++        if minimizationLimit != 0 {
++            let program = Program(with: code)
++            assert(minimizationLimit > 0.0 && minimizationLimit <= 1.0)
++            var analyzer = DefUseAnalyzer(for: program)
++            analyzer.analyze()
++            let numberOfInstructionsToKeep = Int(Double(program.size) * minimizationLimit)
++            var indices = Array(0..<program.size).shuffled()
++
++            while numKeptInstructions < numberOfInstructionsToKeep {
++                // Mark the instructions in the code object that we want to keep.
++                func keep(_ index: Int) {
++                    guard !self.code[index].flags.contains(.notRemovable) else { return }
++
++                    self.code[index].flags.insert(.notRemovable)
++                    self.numKeptInstructions += 1
++
++                    // Keep alive all inputs recursively.
++                    for input in self.code[index].inputs {
++                        // the analyzer returns a *different* instruction, so we actually need the index here.
++                        let inputIndex = analyzer.definition(of: input).index
++                        keep(inputIndex)
++                    }
++                }
++
++                keep(indices.removeLast())
++            }
++        }
++    }
++
++    func removeNops() {
++        assert(!self.finalized)
++        code.removeNops()
++    }
++
++    func clearFlags() {
++        assert(!self.finalized)
++        code.clearFlags()
+     }
+ 
+-    /// Test a reduction and return true if the reduction was Ok, false otherwise.
+-    func test(_ code: Code, expectCodeToBeValid: Bool = true, numExecutions: Int = defaultNumExecutions) -> Bool {
++    /// Returns the final reduced code.
++    /// after this, we don't expect the code to change anymore.
++    func finalize() -> Code {
++        assert(!self.finalized)
++        self.finalized = true
++        return self.code
++    }
++
++    /// Test a reduction and returns true if the reduction was Ok, false otherwise.
++    @discardableResult
++    func testAndCommit(_ newCode: Code, expectCodeToBeValid: Bool = true, numExecutions: Int = defaultNumExecutions, allowRemoving: Instruction.Flags = .empty) -> Bool {
++        assert(!self.finalized)
+         assert(numExecutions > 0)
+-        assert(!expectCodeToBeValid || code.isStaticallyValid())
++        assert(!expectCodeToBeValid || newCode.isStaticallyValid())
+ 
+         // Reducers are allowed to nop instructions without verifying whether their outputs are used.
+         // They are also allowed to remove blocks without verifying whether their opened contexts are required.
+@@ -63,57 +122,58 @@ class MinimizationHelper {
+         // simpler than forcing reducers to always generate valid code.
+         // However, we expect the variables to be numbered continuously. If a reducer reorders variables,
+         // it needs to renumber the variables afterwards as the code will otherwise always be rejected.
+-        assert(code.variablesAreNumberedContinuously())
+-        guard code.isStaticallyValid() else { return false }
+-
+         totalReductions += 1
++        assert(newCode.variablesAreNumberedContinuously())
++        guard newCode.isStaticallyValid() else {
++            failedReductions += 1
++            return false
++        }
++
++        // Check that we still see the same number of flags (except those that we can actually remove)
++        for flag in Instruction.Flags.allCases where !allowRemoving.contains(flag) {
++            if newCode.countIntructionsWith(flags: flag) != code.countIntructionsWith(flags: flag) {
++                failedReductions += 1
++                return false
++            }
++        }
+ 
+         // Run the modified program and see if the patch changed its behaviour
+         var stillHasAspects = false
+         performOnFuzzerQueue {
+             for _ in 0..<numExecutions {
+-                let execution = fuzzer.execute(Program(with: code), withTimeout: fuzzer.config.timeout * 2, purpose: .minimization)
++                let execution = fuzzer.execute(Program(with: newCode), withTimeout: fuzzer.config.timeout * 2, purpose: .minimization)
+                 stillHasAspects = fuzzer.evaluator.hasAspects(execution, aspects)
+                 guard stillHasAspects else { break }
+             }
+         }
+ 
+         if stillHasAspects {
++            // Commit this new code to this instance.
++            // This will later be the minimized sample.
++            self.code = newCode
+             didReduce = true
++            return true
+         } else {
+             failedReductions += 1
++            return false
+         }
+-
+-        return stillHasAspects
+     }
+ 
+     /// Replace the instruction at the given index with the provided replacement if it does not negatively influence the programs previous behaviour.
+     /// The replacement instruction must produce the same output variables as the original instruction.
+     @discardableResult
+-    func tryReplacing(instructionAt index: Int, with newInstr: Instruction, in code: inout Code, expectCodeToBeValid: Bool = true, numExecutions: Int = defaultNumExecutions) -> Bool {
+-        assert(code[index].allOutputs == newInstr.allOutputs)
+-
+-        guard !instructionsToKeep.contains(index) else {
+-            return false
+-        }
+-
+-        let origInstr = code[index]
+-        code[index] = newInstr
+-
+-        let result = test(code, expectCodeToBeValid: expectCodeToBeValid, numExecutions: numExecutions)
++    func tryReplacing(instructionAt index: Int, with newInstr: Instruction, expectCodeToBeValid: Bool = true, numExecutions: Int = defaultNumExecutions, allowRemoving flags: Instruction.Flags = .empty) -> Bool {
++        var newCode = self.code
++        assert(newCode[index].allOutputs == newInstr.allOutputs)
++        newCode[index] = newInstr
+ 
+-        if !result {
+-            // Revert change
+-            code[index] = origInstr
+-        }
+-
+-        return result
++        return testAndCommit(newCode, expectCodeToBeValid: expectCodeToBeValid, numExecutions: numExecutions, allowRemoving: flags)
+     }
+ 
+     @discardableResult
+-    func tryInserting(_ newInstr: Instruction, at index: Int, in code: inout Code, expectCodeToBeValid: Bool = true, numExecutions: Int = defaultNumExecutions) -> Bool {
+-        // Inserting instructions will invalidate the instructionsToKeep list, so that list must be empty here.
+-        assert(instructionsToKeep.isEmpty)
++    func tryInserting(_ newInstr: Instruction, at index: Int, expectCodeToBeValid: Bool = true, numExecutions: Int = defaultNumExecutions) -> Bool {
++        // Right now we don't expect to see any flags here on the new instruction.
++        assert(newInstr.flags.isEmpty)
+ 
+         // For simplicity, just build a copy of the input code here. This logic is not particularly performance sensitive.
+         var newCode = Code()
+@@ -124,50 +184,34 @@ class MinimizationHelper {
+             newCode.append(instr)
+         }
+ 
+-        let result = test(newCode, expectCodeToBeValid: expectCodeToBeValid, numExecutions: numExecutions)
+-
+-        if result {
+-            code = newCode
+-        }
+-
+-        return result
++        return testAndCommit(newCode, expectCodeToBeValid: expectCodeToBeValid, numExecutions: numExecutions)
+     }
+ 
+     /// Remove the instruction at the given index if it does not negatively influence the programs previous behaviour.
+     @discardableResult
+-    func tryNopping(instructionAt index: Int, in code: inout Code, numExecutions: Int = defaultNumExecutions) -> Bool {
+-        return tryReplacing(instructionAt: index, with: nop(for: code[index]), in: &code, expectCodeToBeValid: false, numExecutions: numExecutions)
++    func tryNopping(instructionAt index: Int, numExecutions: Int = defaultNumExecutions, allowRemoving flags: Instruction.Flags = .empty) -> Bool {
++        return tryReplacing(instructionAt: index, with: nop(for: code[index]), expectCodeToBeValid: false, numExecutions: numExecutions, allowRemoving: flags)
+     }
+ 
+     /// Attempt multiple replacements at once.
+     @discardableResult
+-    func tryReplacements(_ replacements: [(Int, Instruction)], in code: inout Code, renumberVariables: Bool = false, expectCodeToBeValid: Bool = true, numExecutions: Int = defaultNumExecutions) -> Bool {
+-        let originalCode = code
++    func tryReplacements(_ replacements: [(Int, Instruction)], renumberVariables: Bool = false, expectCodeToBeValid: Bool = true, numExecutions: Int = defaultNumExecutions, allowRemoving flags: Instruction.Flags = .empty) -> Bool {
++        var newCode = self.code
+ 
+         for (index, newInstr) in replacements {
+-            if instructionsToKeep.contains(index) {
+-                code = originalCode
+-                return false
+-            }
+-            code[index] = newInstr
++            newCode[index] = newInstr
+         }
+ 
+         if renumberVariables {
+-            code.renumberVariables()
+-        }
+-        assert(code.variablesAreNumberedContinuously())
+-
+-        let result = test(code, expectCodeToBeValid: expectCodeToBeValid, numExecutions: numExecutions)
+-        if !result {
+-            code = originalCode
++            newCode.renumberVariables()
+         }
++        assert(newCode.variablesAreNumberedContinuously())
+ 
+-        assert(code.isStaticallyValid())
+-        return result
++        return testAndCommit(newCode, expectCodeToBeValid: expectCodeToBeValid, numExecutions: numExecutions, allowRemoving: flags)
+     }
+ 
+     @discardableResult
+-    func tryReplacing(range: ClosedRange<Int>, in code: inout Code, with newCode: [Instruction], renumberVariables: Bool = false, expectCodeToBeValid: Bool = true, numExecutions: Int = defaultNumExecutions) -> Bool {
++    func tryReplacing(range: ClosedRange<Int>, with newCode: [Instruction], renumberVariables: Bool = false, expectCodeToBeValid: Bool = true, numExecutions: Int = defaultNumExecutions, allowRemoving flags: Instruction.Flags = .empty) -> Bool {
+         assert(range.count >= newCode.count)
+ 
+         var replacements = [(Int, Instruction)]()
+@@ -183,23 +227,23 @@ class MinimizationHelper {
+             replacements.append((indexOfInstructionToReplace, replacement))
+         }
+ 
+-        return tryReplacements(replacements, in: &code, renumberVariables: renumberVariables, expectCodeToBeValid: expectCodeToBeValid, numExecutions: numExecutions)
++        return tryReplacements(replacements, renumberVariables: renumberVariables, expectCodeToBeValid: expectCodeToBeValid, numExecutions: numExecutions, allowRemoving: flags)
+     }
+ 
+     /// Attempt the removal of multiple instructions at once.
+     @discardableResult
+-    func tryNopping(_ indices: [Int], in code: inout Code, expectCodeToBeValid: Bool = false) -> Bool {
++    func tryNopping(_ indices: [Int], expectCodeToBeValid: Bool = false, allowRemoving flags: Instruction.Flags = .empty) -> Bool {
+         var replacements = [(Int, Instruction)]()
+         for index in indices {
+             replacements.append((index, nop(for: code[index])))
+         }
+-        return tryReplacements(replacements, in: &code, expectCodeToBeValid: false)
++        return tryReplacements(replacements, expectCodeToBeValid: false, allowRemoving: flags)
+     }
+ 
+     /// Create a Nop instruction for replacing the given instruction with.
+     func nop(for instr: Instruction) -> Instruction {
+         // We must preserve outputs here to keep variable number contiguous.
+-        return Instruction(Nop(numOutputs: instr.numOutputs + instr.numInnerOutputs), inouts: instr.allOutputs)
++        return Instruction(Nop(numOutputs: instr.numOutputs + instr.numInnerOutputs), inouts: instr.allOutputs, flags: .empty)
+     }
+ }
+ 
+@@ -207,5 +251,5 @@ protocol Reducer {
+     /// Attempt to reduce the given program in some way and return the result.
+     ///
+     /// The returned program can have non-contiguous variable names but must otherwise be valid.
+-    func reduce(_ code: inout Code, with tester: MinimizationHelper)
++    func reduce(with tester: MinimizationHelper)
+ }
+diff --git a/Sources/Fuzzilli/Minimization/MinimizationPostProcessor.swift b/Sources/Fuzzilli/Minimization/MinimizationPostProcessor.swift
+index 0273441..d7f0662 100644
+--- a/Sources/Fuzzilli/Minimization/MinimizationPostProcessor.swift
++++ b/Sources/Fuzzilli/Minimization/MinimizationPostProcessor.swift
+@@ -21,18 +21,18 @@
+ ///
+ /// Like other reducers, changes are only performed if they do not alter the programs relevant behaviour.
+ struct MinimizationPostProcessor {
+-    func process(_ code: inout Code, with helper: MinimizationHelper) {
++    func process(with helper: MinimizationHelper) -> Bool {
+         // Step 1: Generate all changes that we'd like to perform and record them.
+         var changes = [(index: Int, newInstruction: Instruction)]()
++        var codeWithNops = Code()
+ 
+         // This must happen on the fuzzer's queue as it requires a ProgramBuilder to obtain input variables.
+         helper.performOnFuzzerQueue {
+             // For every insertion, we also insert a placeholder Nop into the current code. This way, performing the insertions in step 2 becomes very cheap.
+-            var codeWithNops = Code()
+             let b = helper.fuzzer.makeBuilder()
+             var lastInstr = Instruction(Nop())
+ 
+-            for instr in code {
++            for instr in helper.code {
+                 var addedInstruction: Instruction? = nil
+                 var replacementInstruction: Instruction? = nil
+                 switch instr.op.opcode {
+@@ -87,19 +87,25 @@ struct MinimizationPostProcessor {
+                 codeWithNops.append(instr)
+                 lastInstr = instr
+             }
+-            assert(codeWithNops.count >= code.count)
+-            code = codeWithNops
++            assert(codeWithNops.count >= helper.code.count)
++        }
++
++        if !helper.testAndCommit(codeWithNops) {
++            return false
+         }
+ 
+         // Step 2: Try to apply each change from step 1 on its own and verify that the change doesn't alter the program's behaviour.
+         for change in changes {
+             // Either we're adding a new instruction (in which case we're replacing a nop inserted in step 1), or changing the number of inputs of an existing instruction.
+-            assert((code[change.index].op is Nop && !(change.newInstruction.op is Nop)) ||
+-                   (code[change.index].op.name == change.newInstruction.op.name && code[change.index].numInputs < change.newInstruction.numInputs))
+-            helper.tryReplacing(instructionAt: change.index, with: change.newInstruction, in: &code)
++            assert((helper.code[change.index].op is Nop && !(change.newInstruction.op is Nop)) ||
++                   (helper.code[change.index].op.name == change.newInstruction.op.name && helper.code[change.index].numInputs < change.newInstruction.numInputs))
++            if !helper.tryReplacing(instructionAt: change.index, with: change.newInstruction) {
++                return false
++            }
+         }
+ 
+         // Step 3: Remove any remaining nops from step 1.
+-        code.removeNops()
++        helper.removeNops()
++        return true
+     }
+ }
+diff --git a/Sources/Fuzzilli/Minimization/Minimizer.swift b/Sources/Fuzzilli/Minimization/Minimizer.swift
+index 2f9051f..010aefe 100644
+--- a/Sources/Fuzzilli/Minimization/Minimizer.swift
++++ b/Sources/Fuzzilli/Minimization/Minimizer.swift
+@@ -27,7 +27,10 @@ import Foundation
+ ///     be a configurable limit to minimization which keeps some random instructions alive, so that those are uniformly
+ ///     distributed and not biased to a certain type of instruction or instruction sequence.
+ ///
++/// We *cannot* store any information as indices as they are invalidated as soon as any reducer moves instructions around.
++/// Therefore, also every reducer needs to preserve flags when they operate on an instruction or operation.
+ public class Minimizer: ComponentBase {
++
+     /// DispatchQueue on which program minimization happens.
+     private let minimizationQueue = DispatchQueue(label: "Minimizer")
+ 
+@@ -62,36 +65,13 @@ public class Minimizer: ComponentBase {
+     }
+ 
+     private func internalMinimize(_ program: Program, withAspects aspects: ProgramAspects, limit minimizationLimit: Double, runningSynchronously: Bool) -> Code {
+-        // Implementation of minimization limits:
+-        // Pick N (~= minimizationLimit * programSize) instructions at random which will not be removed during minimization.
+-        // This way, minimization will be sped up (because no executions are necessary for those instructions marked as keep-alive)
+-        // while the instructions that are kept artificially are equally distributed throughout the program.
+-        var keptInstructions = Set<Int>()
+-        if minimizationLimit != 0 {
+-            assert(minimizationLimit > 0.0 && minimizationLimit <= 1.0)
+-            var analyzer = DefUseAnalyzer(for: program)
+-            analyzer.analyze()
+-            let numberOfInstructionsToKeep = Int(Double(program.size) * minimizationLimit)
+-            var indices = Array(0..<program.size).shuffled()
+-
+-            while keptInstructions.count < numberOfInstructionsToKeep {
+-                func keep(_ instr: Instruction) {
+-                    guard !keptInstructions.contains(instr.index) else { return }
+-
+-                    keptInstructions.insert(instr.index)
+-
+-                    // Keep alive all inputs recursively.
+-                    for input in instr.inputs {
+-                        keep(analyzer.definition(of: input))
+-                    }
+-                }
++        assert(program.code.countIntructionsWith(flags: .notRemovable) == 0)
+ 
+-                keep(program.code[indices.removeLast()])
+-            }
+-        }
++        let helper = MinimizationHelper(for: aspects, forCode: program.code, of: fuzzer, runningOnFuzzerQueue: runningSynchronously)
++
++        helper.applyMinimizationLimit(limit: minimizationLimit)
+ 
+-        let helper = MinimizationHelper(for: aspects, of: fuzzer, keeping: keptInstructions, runningOnFuzzerQueue: runningSynchronously)
+-        var code = program.code
++        assert(helper.code.countIntructionsWith(flags: .notRemovable) >= helper.numKeptInstructions)
+ 
+         var iterations = 0
+         repeat {
+@@ -103,28 +83,38 @@ public class Minimizer: ComponentBase {
+             //  - The VariadicInputReducer should run after the InliningReducer as it may remove function call arguments, causing the parameters to be undefined after inlining.
+             let reducers: [Reducer] = [GenericInstructionReducer(), BlockReducer(), SimplifyingReducer(), LoopReducer(), InliningReducer(), ReassignmentReducer(), VariadicInputReducer(), DeduplicatingReducer()]
+             for reducer in reducers {
+-                reducer.reduce(&code, with: helper)
+-                assert(code.isStaticallyValid())
++                reducer.reduce(with: helper)
++                // The reducers should not remove any instructions that we want to keep unconditionally.
++                // The code might have more non-removable instructions due to other analyzers marking them as non-removable
++                // but it should be at least more than we have seen at the start.
++                assert(helper.code.countIntructionsWith(flags: .notRemovable) >= helper.numKeptInstructions)
++                assert(helper.code.isStaticallyValid())
+             }
+             iterations += 1
+             guard iterations < 100 else {
+                 // This can happen if a reducer performs a no-op change in every iteration, e.g. replacing one instruction with the same instruction. This is considered a bug since it leads to this kind of issue.
+-                logger.error("Fixpoint iteration for program minimization did not converge after 100 iterations for program:\n\(FuzzILLifter().lift(code)). Aborting minimization.")
++                logger.error("Fixpoint iteration for program minimization did not converge after 100 iterations for program:\n\(FuzzILLifter().lift(helper.code)). Aborting minimization.")
+                 break
+             }
+         } while helper.didReduce
+ 
+         // Most reducers replace instructions with NOPs instead of deleting them. Remove those NOPs now.
+-        code.removeNops()
++        helper.removeNops()
++        assert(helper.code.countIntructionsWith(flags: .notRemovable) >= helper.numKeptInstructions)
+ 
+         // Post-process the sample after minimization. This step adds certain features back to the program that may have been minimized away but are typically helpful for future mutations.
+         // Currently we run this regardless of whether we're processing a crash or an interesting sample. If we wanted to, we could only run this for interesting samples (that will be mutated again), but its fine to also run it for crashes.
+         // Adding instructions will invalidate the keptInstructions array. Since we're not removing any more instructions, clear that array now.
+-        helper.clearInstructionsToKeep()
++        helper.clearFlags()
++
+         let postProcessor = MinimizationPostProcessor()
+-        postProcessor.process(&code, with: helper)
+-        assert(code.isStaticallyValid())
+ 
+-        return code
++        if !postProcessor.process(with: helper) {
++            logger.warning("Failed to postprocess sample during minimization.")
++        }
++
++        assert(helper.code.isStaticallyValid())
++
++        return helper.finalize()
+     }
+ }
+diff --git a/Sources/Fuzzilli/Minimization/ReassignReducer.swift b/Sources/Fuzzilli/Minimization/ReassignReducer.swift
+index e70491e..0f76133 100644
+--- a/Sources/Fuzzilli/Minimization/ReassignReducer.swift
++++ b/Sources/Fuzzilli/Minimization/ReassignReducer.swift
+@@ -38,13 +38,13 @@
+ // Note that this reducer may change the semantics of the program, for example if reassigned variables are themselves reassigned again.
+ // However, the reducer will still ensure that its changes to not modify the important aspects of the program before committing them.
+ struct ReassignmentReducer: Reducer {
+-    func reduce(_ code: inout Code, with helper: MinimizationHelper) {
++    func reduce(with helper: MinimizationHelper) {
+         var reassignedVariables = VariableMap<Variable>()
+         var reassignedVariableStack: [[Variable]] = [[]]
+         var newCode = Code()
+         var didChangeCode = false
+ 
+-        for instr in code {
++        for instr in helper.code {
+             if instr.isBlockEnd {
+                 let outOfScopeReassignments = reassignedVariableStack.removeLast()
+                 for v in outOfScopeReassignments {
+@@ -78,13 +78,13 @@ struct ReassignmentReducer: Reducer {
+             } else {
+                 let inouts = instr.inouts.map({ reassignedVariables[$0] ?? $0 })
+                 if inouts[...] != instr.inouts { didChangeCode = true }
+-                newCode.append(Instruction(instr.op, inouts: inouts))
++                newCode.append(Instruction(instr.op, inouts: inouts, flags: .empty))
+             }
+         }
+ 
+         assert(newCode.isStaticallyValid())
+-        if didChangeCode && helper.test(newCode) {
+-            code = newCode
++        if didChangeCode {
++            helper.testAndCommit(newCode)
+         }
+     }
+ }
+diff --git a/Sources/Fuzzilli/Minimization/SimplifyingReducer.swift b/Sources/Fuzzilli/Minimization/SimplifyingReducer.swift
+index 96fe39e..600e0e9 100644
+--- a/Sources/Fuzzilli/Minimization/SimplifyingReducer.swift
++++ b/Sources/Fuzzilli/Minimization/SimplifyingReducer.swift
+@@ -14,35 +14,36 @@
+ 
+ // Attempts to simplify "complex" instructions into simpler instructions.
+ struct SimplifyingReducer: Reducer {
+-    func reduce(_ code: inout Code, with helper: MinimizationHelper) {
+-        simplifyFunctionDefinitions(&code, with: helper)
+-        simplifyGuardedInstructions(&code, with: helper)
+-        simplifySingleInstructions(&code, with: helper)
+-        simplifyMultiInstructions(&code, with: helper)
++    func reduce(with helper: MinimizationHelper) {
++        simplifyFunctionDefinitions(with: helper)
++        simplifyGuardedInstructions(with: helper)
++        simplifySingleInstructions(with: helper)
++        simplifyMultiInstructions(with: helper)
+     }
+ 
+-    func simplifyFunctionDefinitions(_ code: inout Code, with helper: MinimizationHelper) {
++    func simplifyFunctionDefinitions(with helper: MinimizationHelper) {
+         // Try to turn "fancy" functions into plain functions
+-        for group in code.findAllBlockGroups() {
+-            guard let begin = code[group.head].op as? BeginAnyFunction else { continue }
+-            assert(code[group.tail].op is EndAnyFunction)
++        for group in helper.code.findAllBlockGroups() {
++            guard let begin = helper.code[group.head].op as? BeginAnyFunction else { continue }
++            assert(helper.code[group.tail].op is EndAnyFunction)
+             if begin is BeginPlainFunction { continue }
+ 
+-            let newBegin = Instruction(BeginPlainFunction(parameters: begin.parameters, isStrict: begin.isStrict), inouts: code[group.head].inouts)
++            let newBegin = Instruction(BeginPlainFunction(parameters: begin.parameters, isStrict: begin.isStrict), inouts: helper.code[group.head].inouts, flags: .empty)
+             let newEnd = Instruction(EndPlainFunction())
+ 
+             // The resulting code may be invalid as we may be changing the context inside the body (e.g. turning an async function into a plain one).
+-            helper.tryReplacements([(group.head, newBegin), (group.tail, newEnd)], in: &code, expectCodeToBeValid: false)
++            helper.tryReplacements([(group.head, newBegin), (group.tail, newEnd)], expectCodeToBeValid: false)
+         }
+     }
+ 
+     /// Simplify instructions that can be replaced by a single, simple instruction.
+-    func simplifySingleInstructions(_ code: inout Code, with helper: MinimizationHelper) {
++    func simplifySingleInstructions(with helper: MinimizationHelper) {
+         // Miscellaneous simplifications. This will:
+         //   - convert SomeOpWithSpread into SomeOp since spread operations are less "mutation friendly" (somewhat low value, high chance of producing invalid code)
+         //   - convert Constructs into Calls
+         //   - convert strict functions into non-strict functions
+-        for instr in code {
++        // Since we only change operations in a forward fashion and never change instructions "in front of us" this iterator should stay valid.
++        for instr in helper.code {
+             var newOp: Operation? = nil
+             switch instr.op.opcode {
+             case .createArrayWithSpread(let op):
+@@ -87,15 +88,15 @@ struct SimplifyingReducer: Reducer {
+             }
+ 
+             if let op = newOp {
+-                helper.tryReplacing(instructionAt: instr.index, with: Instruction(op, inouts: instr.inouts), in: &code)
++                helper.tryReplacing(instructionAt: instr.index, with: Instruction(op, inouts: instr.inouts, flags: .empty))
+             }
+         }
+     }
+ 
+-    func simplifyGuardedInstructions(_ code: inout Code, with helper: MinimizationHelper) {
++    func simplifyGuardedInstructions(with helper: MinimizationHelper) {
+         // This will attempt to turn guarded operations into unguarded ones.
+         // In the lifted JavaScript code, this would turn something like `try { o.foo(); } catch (e) {}` into `o.foo();`
+-        for instr in code {
++        for instr in helper.code {
+             var newOp: Operation? = nil
+             switch instr.op.opcode {
+             case .getProperty(let op):
+@@ -161,13 +162,13 @@ struct SimplifyingReducer: Reducer {
+             }
+ 
+             if let op = newOp {
+-                helper.tryReplacing(instructionAt: instr.index, with: Instruction(op, inouts: instr.inouts), in: &code)
++                helper.tryReplacing(instructionAt: instr.index, with: Instruction(op, inouts: instr.inouts, flags: .empty))
+             }
+         }
+     }
+ 
+     /// Simplify instructions that can be replaced by a sequence of simpler instructions.
+-    func simplifyMultiInstructions(_ code: inout Code, with helper: MinimizationHelper) {
++    func simplifyMultiInstructions(with helper: MinimizationHelper) {
+         // This will:
+         //  - convert destructuring operations into simple property or element loads
+         //
+@@ -176,7 +177,7 @@ struct SimplifyingReducer: Reducer {
+         // these would cause the fixpoint iteration to not terminate.
+         var newCode = Code()
+         var numCopiedInstructions = 0
+-        for instr in code {
++        for instr in helper.code {
+             var keepInstruction = true
+             switch instr.op.opcode {
+             case .destructObject(let op):
+@@ -218,9 +219,9 @@ struct SimplifyingReducer: Reducer {
+             }
+         }
+ 
+-        let didMakeChanges = numCopiedInstructions != code.count
+-        if didMakeChanges && helper.test(newCode) {
+-            code = newCode
++        let didMakeChanges = numCopiedInstructions != helper.code.count
++        if didMakeChanges {
++            helper.testAndCommit(newCode)
+         }
+     }
+ }
+diff --git a/Sources/Fuzzilli/Minimization/VariadicInputReducer.swift b/Sources/Fuzzilli/Minimization/VariadicInputReducer.swift
+index ba4e20f..0c706bc 100644
+--- a/Sources/Fuzzilli/Minimization/VariadicInputReducer.swift
++++ b/Sources/Fuzzilli/Minimization/VariadicInputReducer.swift
+@@ -14,8 +14,8 @@
+ 
+ /// Reducer to remove inputs from variadic operations.
+ struct VariadicInputReducer: Reducer {
+-    func reduce(_ code: inout Code, with helper: MinimizationHelper) {
+-        for instr in code {
++    func reduce(with helper: MinimizationHelper) {
++        for instr in helper.code {
+             guard instr.isVariadic else { continue }
+             let index = instr.index
+ 
+@@ -76,8 +76,8 @@ struct VariadicInputReducer: Reducer {
+                 }
+ 
+                 let inouts = instr.inputs.dropLast() + instr.outputs + instr.innerOutputs
+-                instr = Instruction(newOp, inouts: inouts)
+-            } while helper.tryReplacing(instructionAt: index, with: instr, in: &code)
++                instr = Instruction(newOp, inouts: inouts, flags: instr.flags)
++            } while helper.tryReplacing(instructionAt: index, with: instr)
+         }
+     }
+ }
+diff --git a/Sources/Fuzzilli/Mutators/InputMutator.swift b/Sources/Fuzzilli/Mutators/InputMutator.swift
+index e153a74..ebd84d4 100644
+--- a/Sources/Fuzzilli/Mutators/InputMutator.swift
++++ b/Sources/Fuzzilli/Mutators/InputMutator.swift
+@@ -51,6 +51,9 @@ public class InputMutator: BaseInstructionMutator {
+         b.trace("Replacing input \(selectedInput) (\(inouts[selectedInput])) with \(replacement)")
+         inouts[selectedInput] = replacement
+ 
+-        b.append(Instruction(instr.op, inouts: inouts))
++        // This assert is here to prevent subtle bugs if we ever decide to add flags that are "alive" during program building / mutation.
++        // If we add flags, remove this assert and change the code below.
++        assert(instr.flags == .empty)
++        b.append(Instruction(instr.op, inouts: inouts, flags: .empty))
+     }
+ }
+diff --git a/Sources/Fuzzilli/Mutators/OperationMutator.swift b/Sources/Fuzzilli/Mutators/OperationMutator.swift
+index cf6eaf6..0550b4c 100644
+--- a/Sources/Fuzzilli/Mutators/OperationMutator.swift
++++ b/Sources/Fuzzilli/Mutators/OperationMutator.swift
+@@ -231,7 +231,10 @@ public class OperationMutator: BaseInstructionMutator {
+             fatalError("Unhandled Operation: \(type(of: instr.op))")
+         }
+ 
+-        return Instruction(newOp, inouts: instr.inouts)
++        // This assert is here to prevent subtle bugs if we ever decide to add flags that are "alive" during program building / mutation.
++        // If we add flags, remove this assert and change the code below.
++        assert(instr.flags == .empty)
++        return Instruction(newOp, inouts: instr.inouts, flags: .empty)
+     }
+ 
+     private func extendVariadicOperation(_ instr: Instruction, _ b: ProgramBuilder) -> Instruction {
+@@ -307,7 +310,11 @@ public class OperationMutator: BaseInstructionMutator {
+ 
+         assert(inputs.count != instr.inputs.count)
+         let inouts = inputs + instr.outputs + instr.innerOutputs
+-        return Instruction(newOp, inouts: inouts)
++
++        // This assert is here to prevent subtle bugs if we ever decide to add flags that are "alive" during program building / mutation.
++        // If we add flags, remove this assert and change the code below.
++        assert(instr.flags == .empty)
++        return Instruction(newOp, inouts: inouts, flags: .empty)
+     }
+ 
+     private func replaceRandomElement<T: Comparable>(in elements: inout Array<T>, generatingRandomValuesWith generator: () -> T) {
+diff --git a/Sources/Fuzzilli/Optional/OptionalProgramTemplates/AdditionalProgramTemplates.swift b/Sources/Fuzzilli/Optional/OptionalProgramTemplates/AdditionalProgramTemplates.swift
+new file mode 100644
+index 0000000..4e79c27
+--- /dev/null
++++ b/Sources/Fuzzilli/Optional/OptionalProgramTemplates/AdditionalProgramTemplates.swift
+@@ -0,0 +1,7 @@
++/// Additional program templates to target specific types of bugs.
++public let OptionalProgramTemplates = [
++    ProgramTemplate("Codegen1") { b in
++        b.buildPrefix()
++        b.build(n: 1)
++    },
++]
+diff --git a/Sources/Fuzzilli/Optional/README.md b/Sources/Fuzzilli/Optional/README.md
+new file mode 100644
+index 0000000..4588a0e
+--- /dev/null
++++ b/Sources/Fuzzilli/Optional/README.md
+@@ -0,0 +1 @@
++Here goes the additional elements to provide to the tool based on non-official features.
+diff --git a/Sources/Fuzzilli/Protobuf/ast.pb.swift b/Sources/Fuzzilli/Protobuf/ast.pb.swift
+index c402adf..60d2eb9 100644
+--- a/Sources/Fuzzilli/Protobuf/ast.pb.swift
++++ b/Sources/Fuzzilli/Protobuf/ast.pb.swift
+@@ -905,6 +905,55 @@ public struct Compiler_Protobuf_WithStatement: @unchecked Sendable {
+   fileprivate var _storage = _StorageClass.defaultInstance
+ }
+ 
++public struct Compiler_Protobuf_SwitchStatement: @unchecked Sendable {
++  // SwiftProtobuf.Message conformance is added in an extension below. See the
++  // `Message` and `Message+*Additions` files in the SwiftProtobuf library for
++  // methods supported on all messages.
++
++  public var discriminant: Compiler_Protobuf_Expression {
++    get {return _storage._discriminant ?? Compiler_Protobuf_Expression()}
++    set {_uniqueStorage()._discriminant = newValue}
++  }
++  /// Returns true if `discriminant` has been explicitly set.
++  public var hasDiscriminant: Bool {return _storage._discriminant != nil}
++  /// Clears the value of `discriminant`. Subsequent reads from it will return its default value.
++  public mutating func clearDiscriminant() {_uniqueStorage()._discriminant = nil}
++
++  public var cases: [Compiler_Protobuf_SwitchCase] {
++    get {return _storage._cases}
++    set {_uniqueStorage()._cases = newValue}
++  }
++
++  public var unknownFields = SwiftProtobuf.UnknownStorage()
++
++  public init() {}
++
++  fileprivate var _storage = _StorageClass.defaultInstance
++}
++
++public struct Compiler_Protobuf_SwitchCase: Sendable {
++  // SwiftProtobuf.Message conformance is added in an extension below. See the
++  // `Message` and `Message+*Additions` files in the SwiftProtobuf library for
++  // methods supported on all messages.
++
++  public var test: Compiler_Protobuf_Expression {
++    get {return _test ?? Compiler_Protobuf_Expression()}
++    set {_test = newValue}
++  }
++  /// Returns true if `test` has been explicitly set.
++  public var hasTest: Bool {return self._test != nil}
++  /// Clears the value of `test`. Subsequent reads from it will return its default value.
++  public mutating func clearTest() {self._test = nil}
++
++  public var consequent: [Compiler_Protobuf_Statement] = []
++
++  public var unknownFields = SwiftProtobuf.UnknownStorage()
++
++  public init() {}
++
++  fileprivate var _test: Compiler_Protobuf_Expression? = nil
++}
++
+ public struct Compiler_Protobuf_Statement: @unchecked Sendable {
+   // SwiftProtobuf.Message conformance is added in an extension below. See the
+   // `Message` and `Message+*Additions` files in the SwiftProtobuf library for
+@@ -1059,6 +1108,14 @@ public struct Compiler_Protobuf_Statement: @unchecked Sendable {
+     set {_uniqueStorage()._statement = .withStatement(newValue)}
+   }
+ 
++  public var switchStatement: Compiler_Protobuf_SwitchStatement {
++    get {
++      if case .switchStatement(let v)? = _storage._statement {return v}
++      return Compiler_Protobuf_SwitchStatement()
++    }
++    set {_uniqueStorage()._statement = .switchStatement(newValue)}
++  }
++
+   public var unknownFields = SwiftProtobuf.UnknownStorage()
+ 
+   public enum OneOf_Statement: Equatable, Sendable {
+@@ -1080,6 +1137,7 @@ public struct Compiler_Protobuf_Statement: @unchecked Sendable {
+     case tryStatement(Compiler_Protobuf_TryStatement)
+     case throwStatement(Compiler_Protobuf_ThrowStatement)
+     case withStatement(Compiler_Protobuf_WithStatement)
++    case switchStatement(Compiler_Protobuf_SwitchStatement)
+ 
+   }
+ 
+@@ -4019,6 +4077,132 @@ extension Compiler_Protobuf_WithStatement: SwiftProtobuf.Message, SwiftProtobuf.
+   }
+ }
+ 
++extension Compiler_Protobuf_SwitchStatement: SwiftProtobuf.Message, SwiftProtobuf._MessageImplementationBase, SwiftProtobuf._ProtoNameProviding {
++  public static let protoMessageName: String = _protobuf_package + ".SwitchStatement"
++  public static let _protobuf_nameMap: SwiftProtobuf._NameMap = [
++    1: .same(proto: "discriminant"),
++    2: .same(proto: "cases"),
++  ]
++
++  fileprivate class _StorageClass {
++    var _discriminant: Compiler_Protobuf_Expression? = nil
++    var _cases: [Compiler_Protobuf_SwitchCase] = []
++
++    #if swift(>=5.10)
++      // This property is used as the initial default value for new instances of the type.
++      // The type itself is protecting the reference to its storage via CoW semantics.
++      // This will force a copy to be made of this reference when the first mutation occurs;
++      // hence, it is safe to mark this as `nonisolated(unsafe)`.
++      static nonisolated(unsafe) let defaultInstance = _StorageClass()
++    #else
++      static let defaultInstance = _StorageClass()
++    #endif
++
++    private init() {}
++
++    init(copying source: _StorageClass) {
++      _discriminant = source._discriminant
++      _cases = source._cases
++    }
++  }
++
++  fileprivate mutating func _uniqueStorage() -> _StorageClass {
++    if !isKnownUniquelyReferenced(&_storage) {
++      _storage = _StorageClass(copying: _storage)
++    }
++    return _storage
++  }
++
++  public mutating func decodeMessage<D: SwiftProtobuf.Decoder>(decoder: inout D) throws {
++    _ = _uniqueStorage()
++    try withExtendedLifetime(_storage) { (_storage: _StorageClass) in
++      while let fieldNumber = try decoder.nextFieldNumber() {
++        // The use of inline closures is to circumvent an issue where the compiler
++        // allocates stack space for every case branch when no optimizations are
++        // enabled. https://github.com/apple/swift-protobuf/issues/1034
++        switch fieldNumber {
++        case 1: try { try decoder.decodeSingularMessageField(value: &_storage._discriminant) }()
++        case 2: try { try decoder.decodeRepeatedMessageField(value: &_storage._cases) }()
++        default: break
++        }
++      }
++    }
++  }
++
++  public func traverse<V: SwiftProtobuf.Visitor>(visitor: inout V) throws {
++    try withExtendedLifetime(_storage) { (_storage: _StorageClass) in
++      // The use of inline closures is to circumvent an issue where the compiler
++      // allocates stack space for every if/case branch local when no optimizations
++      // are enabled. https://github.com/apple/swift-protobuf/issues/1034 and
++      // https://github.com/apple/swift-protobuf/issues/1182
++      try { if let v = _storage._discriminant {
++        try visitor.visitSingularMessageField(value: v, fieldNumber: 1)
++      } }()
++      if !_storage._cases.isEmpty {
++        try visitor.visitRepeatedMessageField(value: _storage._cases, fieldNumber: 2)
++      }
++    }
++    try unknownFields.traverse(visitor: &visitor)
++  }
++
++  public static func ==(lhs: Compiler_Protobuf_SwitchStatement, rhs: Compiler_Protobuf_SwitchStatement) -> Bool {
++    if lhs._storage !== rhs._storage {
++      let storagesAreEqual: Bool = withExtendedLifetime((lhs._storage, rhs._storage)) { (_args: (_StorageClass, _StorageClass)) in
++        let _storage = _args.0
++        let rhs_storage = _args.1
++        if _storage._discriminant != rhs_storage._discriminant {return false}
++        if _storage._cases != rhs_storage._cases {return false}
++        return true
++      }
++      if !storagesAreEqual {return false}
++    }
++    if lhs.unknownFields != rhs.unknownFields {return false}
++    return true
++  }
++}
++
++extension Compiler_Protobuf_SwitchCase: SwiftProtobuf.Message, SwiftProtobuf._MessageImplementationBase, SwiftProtobuf._ProtoNameProviding {
++  public static let protoMessageName: String = _protobuf_package + ".SwitchCase"
++  public static let _protobuf_nameMap: SwiftProtobuf._NameMap = [
++    1: .same(proto: "test"),
++    2: .same(proto: "consequent"),
++  ]
++
++  public mutating func decodeMessage<D: SwiftProtobuf.Decoder>(decoder: inout D) throws {
++    while let fieldNumber = try decoder.nextFieldNumber() {
++      // The use of inline closures is to circumvent an issue where the compiler
++      // allocates stack space for every case branch when no optimizations are
++      // enabled. https://github.com/apple/swift-protobuf/issues/1034
++      switch fieldNumber {
++      case 1: try { try decoder.decodeSingularMessageField(value: &self._test) }()
++      case 2: try { try decoder.decodeRepeatedMessageField(value: &self.consequent) }()
++      default: break
++      }
++    }
++  }
++
++  public func traverse<V: SwiftProtobuf.Visitor>(visitor: inout V) throws {
++    // The use of inline closures is to circumvent an issue where the compiler
++    // allocates stack space for every if/case branch local when no optimizations
++    // are enabled. https://github.com/apple/swift-protobuf/issues/1034 and
++    // https://github.com/apple/swift-protobuf/issues/1182
++    try { if let v = self._test {
++      try visitor.visitSingularMessageField(value: v, fieldNumber: 1)
++    } }()
++    if !self.consequent.isEmpty {
++      try visitor.visitRepeatedMessageField(value: self.consequent, fieldNumber: 2)
++    }
++    try unknownFields.traverse(visitor: &visitor)
++  }
++
++  public static func ==(lhs: Compiler_Protobuf_SwitchCase, rhs: Compiler_Protobuf_SwitchCase) -> Bool {
++    if lhs._test != rhs._test {return false}
++    if lhs.consequent != rhs.consequent {return false}
++    if lhs.unknownFields != rhs.unknownFields {return false}
++    return true
++  }
++}
++
+ extension Compiler_Protobuf_Statement: SwiftProtobuf.Message, SwiftProtobuf._MessageImplementationBase, SwiftProtobuf._ProtoNameProviding {
+   public static let protoMessageName: String = _protobuf_package + ".Statement"
+   public static let _protobuf_nameMap: SwiftProtobuf._NameMap = [
+@@ -4040,6 +4224,7 @@ extension Compiler_Protobuf_Statement: SwiftProtobuf.Message, SwiftProtobuf._Mes
+     16: .same(proto: "tryStatement"),
+     17: .same(proto: "throwStatement"),
+     18: .same(proto: "withStatement"),
++    19: .same(proto: "switchStatement"),
+   ]
+ 
+   fileprivate class _StorageClass {
+@@ -4311,6 +4496,19 @@ extension Compiler_Protobuf_Statement: SwiftProtobuf.Message, SwiftProtobuf._Mes
+             _storage._statement = .withStatement(v)
+           }
+         }()
++        case 19: try {
++          var v: Compiler_Protobuf_SwitchStatement?
++          var hadOneofValue = false
++          if let current = _storage._statement {
++            hadOneofValue = true
++            if case .switchStatement(let m) = current {v = m}
++          }
++          try decoder.decodeSingularMessageField(value: &v)
++          if let v = v {
++            if hadOneofValue {try decoder.handleConflictingOneOf()}
++            _storage._statement = .switchStatement(v)
++          }
++        }()
+         default: break
+         }
+       }
+@@ -4396,6 +4594,10 @@ extension Compiler_Protobuf_Statement: SwiftProtobuf.Message, SwiftProtobuf._Mes
+         guard case .withStatement(let v)? = _storage._statement else { preconditionFailure() }
+         try visitor.visitSingularMessageField(value: v, fieldNumber: 18)
+       }()
++      case .switchStatement?: try {
++        guard case .switchStatement(let v)? = _storage._statement else { preconditionFailure() }
++        try visitor.visitSingularMessageField(value: v, fieldNumber: 19)
++      }()
+       case nil: break
+       }
+     }
+diff --git a/Sources/Fuzzilli/Protobuf/ast.proto b/Sources/Fuzzilli/Protobuf/ast.proto
+index 3754b02..3db9a50 100644
+--- a/Sources/Fuzzilli/Protobuf/ast.proto
++++ b/Sources/Fuzzilli/Protobuf/ast.proto
+@@ -207,6 +207,16 @@ message WithStatement {
+     Statement body = 2;
+ }
+ 
++message SwitchStatement {
++    Expression discriminant = 1;
++    repeated SwitchCase cases = 2;
++}
++
++message SwitchCase {
++    Expression test = 1;
++    repeated Statement consequent = 2;
++}
++
+ message Statement {
+     oneof statement {
+         EmptyStatement emptyStatement = 1;
+@@ -227,6 +237,7 @@ message Statement {
+         TryStatement tryStatement = 16;
+         ThrowStatement throwStatement = 17;
+         WithStatement withStatement = 18;
++        SwitchStatement switchStatement = 19;
+     }
+ }
+ 
+diff --git a/Sources/FuzzilliCli/Profiles/V8Profile.swift b/Sources/FuzzilliCli/Profiles/V8Profile.swift
+index 748e5d4..53b12a9 100644
+--- a/Sources/FuzzilliCli/Profiles/V8Profile.swift
++++ b/Sources/FuzzilliCli/Profiles/V8Profile.swift
+@@ -635,7 +635,7 @@ let v8Profile = Profile(
+ 
+     additionalBuiltins: [
+         "gc"                                            : .function([] => (.undefined | .jsPromise)),
+-        "d8"                                            : .object(),
++        "d8"                                            : .object(withProperties: ["test"]),
+         "Worker"                                        : .constructor([.anything, .object()] => .object(withMethods: ["postMessage","getMessage"])),
+     ],
+ 
+diff --git a/Sources/FuzzilliCli/main.swift b/Sources/FuzzilliCli/main.swift
+index 6c5cb3d..7e4f527 100644
+--- a/Sources/FuzzilliCli/main.swift
++++ b/Sources/FuzzilliCli/main.swift
+@@ -97,6 +97,10 @@ Options:
+     --additionalArguments=args   : Pass additional arguments to the JS engine. If multiple arguments are passed, they should be separated by a comma.
+     --tag=tag                    : Optional string tag associated with this instance which will be stored in the settings.json file as well as in crashing samples.
+                                    This can for example be used to remember the target revision that is being fuzzed.
++-------------------------------------------------------------------------------------------------------------------------------------------------------------------
++ADDITIONAL : 
++    --templateName               : Used to specify a template to use when using the HybridEngine. [default, custom, <TEMPLATE_NAME>]
++    --jsCorpusPath=<PATH>        : Specifying a Path to use to get Javascript files that will be compiled to generate a corpus.
+ """)
+     exit(0)
+ }
+@@ -152,6 +156,10 @@ let swarmTesting = args.has("--swarmTesting")
+ let argumentRandomization = args.has("--argumentRandomization")
+ let additionalArguments = args["--additionalArguments"] ?? ""
+ let tag = args["--tag"]
++// ====== Additional ======
++let templateName = args["--templateName"] ?? "default"
++let jsCorpusImportPath = args["--jsCorpusPath"]
++// ========================
+ 
+ guard numJobs >= 1 else {
+     configError("Must have at least 1 job")
+@@ -248,7 +256,7 @@ if corpusImportPath != nil && corpusImportMode == .full && corpusName == "markov
+     configError("Markov corpus is not compatible with the .full corpus import mode")
+ }
+ 
+-guard !resume || corpusImportPath == nil else {
++guard !resume || corpusImportPath == nil || jsCorpusImportPath  == nil else {
+     configError("Cannot resume and import an existing corpus at the same time")
+ }
+ 
+@@ -286,7 +294,7 @@ guard let corpusSyncMode = corpusSyncModeByName[corpusSyncMode] else {
+     configError("Invalid corpus synchronization mode \(corpusSyncMode)")
+ }
+ 
+-if staticCorpus && !(resume || isNetworkChildNode || corpusImportPath != nil) {
++if staticCorpus && !(resume || isNetworkChildNode || corpusImportPath != nil || jsCorpusImportPath != nil) {
+     configError("Static corpus requires this instance to import a corpus or to participate in distributed fuzzing as a child node")
+ }
+ 
+@@ -360,6 +368,43 @@ func loadCorpus(from dirPath: String) -> [Program] {
+     return programs
+ }
+ 
++func loadJSCorpus(from dirPath: String) -> [Program] {
++    var isDir: ObjCBool = false
++    guard FileManager.default.fileExists(atPath: dirPath, isDirectory: &isDir) && isDir.boolValue else {
++        logger.fatal("Cannot import programs from \(dirPath), it is not a directory!")
++    }
++
++    var programs = [Program]()
++    let fileEnumerator = FileManager.default.enumerator(atPath: dirPath)
++    while let filename = fileEnumerator?.nextObject() as? String {
++        guard filename.hasSuffix(".js") else { continue }
++        let path = dirPath + "/"
++        let fname : String
++        do {
++            let compilerUtils = CompilerUtils()
++            fname = compilerUtils.compileJavascript(path + filename)
++        }
++        catch {
++            logger.error("Failed to compile program \(filename): \(error). Skipping")
++            continue
++        }
++        guard fname.hasSuffix(".fzil") else { continue }
++        do {
++            let data = try Data(contentsOf: URL(fileURLWithPath: path + fname))
++            let pb = try Fuzzilli_Protobuf_Program(serializedBytes: data)
++            let program = try Program.init(from: pb)
++            if !program.isEmpty {
++                programs.append(program)
++            }
++        } catch {
++            logger.error("Failed to load program \(path + fname): \(error). Skipping")
++        }
++    }
++
++    return programs
++}
++
++
+ // When using multiple jobs, all Fuzzilli instances should use the same arguments for the JS shell, even if
+ // argument randomization is enabled. This way, their corpora are "compatible" and crashes that require
+ // (a subset of) the randomly chosen flags can be reproduced on the main instance.
+@@ -427,15 +472,34 @@ func makeFuzzer(with configuration: Configuration) -> Fuzzer {
+     }
+ 
+     // Program templates to use.
+-    var programTemplates = profile.additionalProgramTemplates
+-    for template in ProgramTemplates {
+-        guard let weight = programTemplateWeights[template.name] else {
+-            print("Missing weight for program template \(template.name) in ProgramTemplateWeights.swift")
+-            exit(-1)
+-        }
++    var programTemplates = WeightedList<ProgramTemplate>([])
++    if templateName == "default" {
++        programTemplates = profile.additionalProgramTemplates
++        for template in ProgramTemplates {
++            guard let weight = programTemplateWeights[template.name] else {
++                print("Missing weight for program template \(template.name) in ProgramTemplateWeights.swift")
++                exit(-1)
++            }
+ 
+-        programTemplates.append(template, withWeight: weight)
++            programTemplates.append(template, withWeight: weight)
++        }
++    } else if templateName == "custom" {
++        for template in OptionalProgramTemplates {
++            programTemplates.append(template, withWeight: 1)
++        }
++    } else {
++        for template in OptionalProgramTemplates {
++            if template.name == templateName {
++                programTemplates.append(template, withWeight: 1)
++                break
++            }
++        }
++    }
++    if programTemplates.count == 0 {
++        print("Template name : \(templateName) could not be found in OptionalProgramTemplates.swift")
++        exit(-1)
+     }
++    print("Using Template : \(templateName)")
+ 
+     // The environment containing available builtins, property names, and method names.
+     let environment = JavaScriptEnvironment(additionalBuiltins: profile.additionalBuiltins, additionalObjectGroups: profile.additionalObjectGroups)
+@@ -595,7 +659,7 @@ fuzzer.sync {
+         fuzzer.scheduleCorpusImport(corpus, importMode: .interestingOnly(shouldMinimize: false))  // We assume that the programs are already minimized
+     }
+ 
+-    // ... or import an existing corpus.
++    // import an existing corpus.
+     if let path = corpusImportPath {
+         assert(!resume)
+         let corpus = loadCorpus(from: path)
+@@ -606,6 +670,17 @@ fuzzer.sync {
+         fuzzer.scheduleCorpusImport(corpus, importMode: corpusImportMode)
+     }
+ 
++    // ... or import a js corpus.
++    if let path = jsCorpusImportPath {
++        assert(!resume)
++        let corpus = loadJSCorpus(from: path)
++        guard !corpus.isEmpty else {
++            logger.fatal("Cannot import an empty corpus.")
++        }
++        logger.info("Scheduling corpus import of \(corpus.count) programs with mode \(corpusImportModeName).")
++        fuzzer.scheduleCorpusImport(corpus, importMode: corpusImportMode)
++    }
++
+     // Initialize the fuzzer, and run startup tests
+     fuzzer.initialize()
+     fuzzer.runStartupTests()
+diff --git a/Sources/libcoverage/coverage.c b/Sources/libcoverage/coverage.c
+index d8950fa..9827d3f 100644
+--- a/Sources/libcoverage/coverage.c
++++ b/Sources/libcoverage/coverage.c
+@@ -38,8 +38,6 @@
+ 
+ #define unlikely(cond) __builtin_expect(!!(cond), 0)
+ 
+-#define SHM_SIZE 0x100000
+-#define MAX_EDGES ((SHM_SIZE - 4) * 8)
+ static_assert(MAX_EDGES <= UINT32_MAX, "Edges must be addressable using a 32-bit index");
+ 
+ static inline int edge(const uint8_t* bits, uint64_t index)
+diff --git a/Sources/libreprl/libreprl-posix.c b/Sources/libreprl/libreprl-posix.c
+index 12da02e..beae1d6 100644
+--- a/Sources/libreprl/libreprl-posix.c
++++ b/Sources/libreprl/libreprl-posix.c
+@@ -29,9 +29,12 @@
+ #include <stdio.h>
+ #include <stdlib.h>
+ #include <string.h>
++#include <sched.h>
+ #include <sys/mman.h>
++#include <sys/mount.h>
+ #include <sys/resource.h>
+ #include <sys/time.h>
++#include <sys/stat.h>
+ #include <sys/types.h>
+ #include <sys/wait.h>
+ #include <time.h>
+@@ -199,6 +202,17 @@ static int reprl_spawn_child(struct reprl_context* ctx)
+     fcntl(ctx->ctrl_in, F_SETFD, FD_CLOEXEC);
+     fcntl(ctx->ctrl_out, F_SETFD, FD_CLOEXEC);
+ 
++#ifdef __linux__
++    // Create the mountpoint for our tmpfs here. This is just an empty dir.
++    // We also do not really care if this directory exists, we just need it as
++    // a mountpoint.
++    if (mkdir("/tmp/fuzzilli_tmp/", 0)) {
++        if (errno != EEXIST) {
++          fprintf(stderr, "mkdir failed to create /tmp/fuzzilli_dir to create a mountpoint: %s\n", strerror(errno));
++        }
++    }
++#endif
++
+ #ifdef __linux__
+     // Use vfork() on Linux as that considerably improves the fuzzer performance. See also https://github.com/googleprojectzero/fuzzilli/issues/174
+     // Due to vfork, the code executed in the child process *must not* modify any memory apart from its stack, as it will share the page table of its parent.
+@@ -247,6 +261,23 @@ static int reprl_spawn_child(struct reprl_context* ctx)
+         else dup2(devnull, 2);
+         close(devnull);
+ 
++#ifdef __linux__
++        // We create a new user (CLONE_NEWUSER) and mount (CLONE_NEWNS)
++        // namespace here such that we can mount our own tmpfs onto
++        // /tmp/fuzzilli_tmp that is only visible to this child process.
++        if (unshare(CLONE_NEWUSER | CLONE_NEWNS) == -1) {
++            fprintf(stderr, "unshare failed to create a new mount namespace in the child: %s\n", strerror(errno));
++            _exit(-1);
++        };
++
++        // Mount a new tmpfs onto /tmp/fuzzilli_tmp this allows us to add files
++        // here that get automatically cleaned up once the process exits.
++        if (mount("tmpfs", "/tmp/fuzzilli_tmp", "tmpfs", 0, NULL) == -1) {
++            fprintf(stderr, "mount failed to create a tmpfs in namespace in the child: %s\n", strerror(errno));
++            _exit(-1);
++        }
++#endif
++
+         // close all other FDs. We try to use FD_CLOEXEC everywhere, but let's be extra sure we don't leak any fds to the child.
+         int tablesize = getdtablesize();
+         for (int i = 3; i < tablesize; i++) {
+diff --git a/Tests/FuzzilliTests/CompilerTests/switch_statements.js b/Tests/FuzzilliTests/CompilerTests/switch_statements.js
+new file mode 100644
+index 0000000..929236c
+--- /dev/null
++++ b/Tests/FuzzilliTests/CompilerTests/switch_statements.js
+@@ -0,0 +1,26 @@
++let fruit = 'apple';
++for (let i = 0; i < 3; i++) {
++  switch (fruit) {
++    case 'apple': // test if this case falls through
++      console.log('You selected an apple.');
++      for (let j = 0; j < 2; j++) {
++          console.log('Inside apple loop', j);
++          if (j === 1) {
++              break; // test if this break exits the inner loop
++          }
++      }
++    case null:
++        console.log('You selected null.');
++        break; // Babel parses default case as null case. Try to confuse the compiler.
++    default: // test if default case is detected (irrespective of the convention that the last case is the default case)
++      console.log('Unknown fruit selection.'); // test falls through
++      break; // test if this break exits the switch
++    case 'banana':
++      console.log('You selected a banana.');
++      break; // test if this break exits the switch
++
++  }
++  if (i === 2) {
++      break; // test if this break exits the outer loop
++  }
++}
+\ No newline at end of file
+diff --git a/Tests/FuzzilliTests/MinimizerTest.swift b/Tests/FuzzilliTests/MinimizerTest.swift
+index e34dd5b..d75e6c5 100644
+--- a/Tests/FuzzilliTests/MinimizerTest.swift
++++ b/Tests/FuzzilliTests/MinimizerTest.swift
+@@ -17,6 +17,23 @@ import XCTest
+ 
+ class MinimizerTests: XCTestCase {
+ 
++    func testMinimizationLimit() {
++        let evaluator = EvaluatorForMinimizationTests()
++        let fuzzer = makeMockFuzzer(evaluator: evaluator)
++        let b = fuzzer.makeBuilder()
++
++        for _ in 0..<10 {
++            b.buildPrefix()
++            b.build(n: 70)
++
++            let preMinimization = b.finalize()
++            let limit = 0.1
++
++            let result = minimize(preMinimization, with: fuzzer, limit: limit)
++            XCTAssert(result.size >= Int(Double(preMinimization.size) * limit))
++        }
++    }
++
+     func testGenericInstructionMinimization() {
+         let evaluator = EvaluatorForMinimizationTests()
+         let fuzzer = makeMockFuzzer(evaluator: evaluator)
+@@ -1373,10 +1390,10 @@ class MinimizerTests: XCTestCase {
+     }
+ 
+     // Helper function to perform the minimization.
+-    func minimize(_ program: Program, with fuzzer: Fuzzer) -> Program {
++    func minimize(_ program: Program, with fuzzer: Fuzzer, limit: Double = 0.0) -> Program {
+         guard let evaluator = fuzzer.evaluator as? EvaluatorForMinimizationTests else { fatalError("Invalid Evaluator used for minimization tests: \(fuzzer.evaluator)") }
+         evaluator.setOriginalProgram(program)
+         let dummyAspects = ProgramAspects(outcome: .succeeded)
+-        return fuzzer.minimizer.minimize(program, withAspects: dummyAspects)
++        return fuzzer.minimizer.minimize(program, withAspects: dummyAspects, limit: limit)
+     }
+ }
+diff --git a/Tests/FuzzilliTests/ProgramBuilderTest.swift b/Tests/FuzzilliTests/ProgramBuilderTest.swift
+index de597f1..1c60022 100644
+--- a/Tests/FuzzilliTests/ProgramBuilderTest.swift
++++ b/Tests/FuzzilliTests/ProgramBuilderTest.swift
+@@ -2426,8 +2426,10 @@ class ProgramBuilderTests: XCTestCase {
+ 
+         let typeA: ILType = .object(withProperties: ["a", "b"])
+         let typeB: ILType = .object(withProperties: ["c", "d"])
++        let typeC: ILType = .object(withProperties: ["e", "f"])
+ 
+         let signature: Signature = [.plain(typeA), .plain(typeB)] => .undefined
++        let signature2: Signature = [.plain(typeC), .plain(typeC)] => .undefined
+ 
+         var args = b.findOrGenerateArguments(forSignature: signature)
+         XCTAssertEqual(args.count, 2)
+@@ -2438,11 +2440,11 @@ class ProgramBuilderTests: XCTestCase {
+ 
+         let previous = b.numberOfVisibleVariables
+ 
+-        args = b.findOrGenerateArguments(forSignature: signature, maxNumberOfVariablesToGenerate: 1)
++        args = b.findOrGenerateArguments(forSignature: signature2, maxNumberOfVariablesToGenerate: 1)
+         XCTAssertEqual(args.count, 2)
+ 
+         // Ensure first object has the right type, and that we only generated one more variable
+-        XCTAssert(b.type(of: args[0]).Is(typeA))
++        XCTAssert(b.type(of: args[0]).Is(typeC))
+         XCTAssertEqual(b.numberOfVisibleVariables, previous + 1)
+     }
+ }
+diff --git a/corpus/test.fzil b/corpus/test.fzil
+new file mode 100644
+index 0000000..a3aa507
+Binary files /dev/null and b/corpus/test.fzil differ
+diff --git a/corpus/test.js b/corpus/test.js
+new file mode 100644
+index 0000000..57d1d61
+--- /dev/null
++++ b/corpus/test.js
+@@ -0,0 +1 @@
++let a = 3;

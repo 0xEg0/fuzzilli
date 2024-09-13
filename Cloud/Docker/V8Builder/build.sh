@@ -11,7 +11,7 @@ cp -R $FUZZILLI_ROOT/Targets/V8/Patches .
 cp $FUZZILLI_ROOT/Targets/V8/fuzzbuild.sh .
 
 # Fetch the source code, apply patches, and compile the engine
-docker build --build-arg rev=$REV -t v8_builder .
+docker build --no-cache --build-arg rev=$REV -t v8_builder .
 
 # Copy build products
 mkdir -p out
